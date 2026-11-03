@@ -830,10 +830,14 @@ def _fire_uninstall_scripts(
     """Build a script runner and fire an uninstall lifecycle event.
 
     Best-effort: all exceptions are swallowed so scripts never block
-    the uninstall flow.
+    the uninstall flow, except a failed required pre-uninstall script,
+    which is reported and exits 1 before anything changes.
     """
     import contextlib
 
+    from apm_cli.core.lifecycle_scripts import RequiredScriptError
+
+    required_failure: RequiredScriptError | None = None
     with contextlib.suppress(Exception):
         from apm_cli.core.lifecycle_scripts import (
             LifecycleEvent,
@@ -856,4 +860,11 @@ def _fire_uninstall_scripts(
             working_directory=str(deploy_root),
         )
 
-        runner.fire(event_name, event)
+        try:
+            runner.fire(event_name, event)
+        except RequiredScriptError as exc:
+            required_failure = exc
+
+    if required_failure is not None:
+        logger.error(str(required_failure))
+        sys.exit(1)

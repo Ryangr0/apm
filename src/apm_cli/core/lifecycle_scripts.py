@@ -1,8 +1,8 @@
 """Lifecycle script models, runner, and discovery.
 
 APM supports lifecycle scripts that fire at key moments during install,
-update, and uninstall operations.  Scripts are configured in well-known
-locations discovered from three tiers:
+update, uninstall, and compile operations.  Scripts are configured in
+well-known locations discovered from three tiers:
 
 1. Policy  -- platform-specific admin directory (JSON drop-ins, unchanged)
 2. User    -- ~/.apm/apm.yml (or $APM_HOME/apm.yml) lifecycle: key
@@ -23,7 +23,11 @@ An optional description field may be added to any entry as a
 free-text annotation (surfaced in dry-run output; otherwise ignored).
 
 Scripts run in source order at each event.  Failures are isolated: a
-script error is logged (verbose) but never aborts the CLI operation.
+script error is logged (verbose) but never aborts the CLI operation,
+unless the entry sets required: true (command scripts on pre-* events
+only, so the operation has not started yet).  A required script that
+fails, times out, or is skipped because its project tier is untrusted
+raises RequiredScriptError, which aborts the operation.
 HTTP scripts dispatch asynchronously (daemon thread); command scripts
 run synchronously and can therefore delay the operation up to their
 timeout.  Use APM_NO_SCRIPTS=1 to disable all scripts for one run.
@@ -54,6 +58,7 @@ LIFECYCLE_EVENTS = (
     "post-update",
     "pre-uninstall",
     "post-uninstall",
+    "pre-compile",
 )
 
 # Supported script action types.
@@ -61,6 +66,10 @@ SCRIPT_TYPES = ("command", "http")
 
 # Current script-file schema version (used by admin/user JSON tier only).
 SCRIPT_FILE_VERSION = 1
+
+
+class RequiredScriptError(Exception):
+    """A script marked ``required: true`` did not succeed, so the operation stops."""
 
 
 # -- Event model -----------------------------------------------------------
@@ -136,6 +145,9 @@ class ScriptEntry:
                      credential denylist (e.g. ANALYTICS_TOKEN).
         description: Optional free-text annotation for the script entry.
                      Surfaced in dry-run output; otherwise ignored.
+        required:    When true (command scripts on pre-* events only), a
+                     failure, timeout, or untrusted skip aborts the
+                     operation before it starts instead of being isolated.
         source:      Where this script was defined: policy, user, or project.
         source_file: Path of the file that declared this script.
     """
@@ -151,6 +163,7 @@ class ScriptEntry:
     env: dict[str, str] | None = None
     allowed_env_vars: list[str] | None = None
     description: str | None = None
+    required: bool = False
     source: str = "project"
     source_file: str | None = None
 
@@ -213,6 +226,11 @@ def _build_entry(raw: object, event_name: str, path: Path, source: str) -> Scrip
         env=raw.get("env"),
         allowed_env_vars=_parse_allowed_env_vars(raw.get("allowedEnvVars")),
         description=raw.get("description"),
+        required=(
+            script_type == "command"
+            and event_name.startswith("pre-")
+            and raw.get("required") is True
+        ),
         source=source,
         source_file=str(path),
     )
@@ -428,7 +446,8 @@ class LifecycleScriptRunner:
     """Collects scripts and fires them for lifecycle events.
 
     Scripts run with error isolation: a failure in one script never blocks
-    the CLI or the remaining scripts.  http scripts dispatch
+    the CLI or the remaining scripts, except a command script marked
+    required, whose failure raises RequiredScriptError.  http scripts dispatch
     asynchronously; command scripts run synchronously and may delay
     the operation up to their per-script timeout.
     """
@@ -441,8 +460,10 @@ class LifecycleScriptRunner:
         project_root: str | None = None,
         skipped_project_scripts: int = 0,
         skipped_project_file: str | None = None,
+        skipped_entries: list[ScriptEntry] | None = None,
     ) -> None:
         self._scripts = scripts or []
+        self._skipped_entries = skipped_entries or []
         self._logger = logger
         self._verbose = verbose
         self._project_root = project_root
@@ -477,10 +498,24 @@ class LifecycleScriptRunner:
 
         Returns a list of daemon threads started by HTTP scripts so
         callers can optionally join them (e.g. for test/dry-run).
+
+        Raises:
+            RequiredScriptError: a required script for this event failed,
+                timed out, or was skipped because the project tier is not
+                trusted.  Scripts after it do not run.
         """
         from apm_cli.core.script_executors import dispatch_http_batch, execute_script
 
         self._emit_skip_notice()
+
+        untrusted = [s for s in self._skipped_entries if s.required and s.event == event_name]
+        if untrusted:
+            raise RequiredScriptError(
+                f"{len(untrusted)} required {event_name} script(s) in "
+                f"{self._skipped_project_file or 'apm.yml'} are not trusted. Review the "
+                "lifecycle: block and run 'apm lifecycle trust', or set APM_NO_SCRIPTS=1 "
+                "to skip all lifecycle scripts."
+            )
 
         matching = [s for s in self._scripts if s.event == event_name]
         if not matching:
@@ -493,6 +528,9 @@ class LifecycleScriptRunner:
         for script in matching:
             if script.script_type == "http":
                 http_scripts.append(script)
+                continue
+            if script.required:
+                self._run_required(script, event_name, event)
                 continue
             try:
                 execute_script(
@@ -520,6 +558,41 @@ class LifecycleScriptRunner:
             logger=self._logger,
             verbose=self._verbose,
         )
+
+    def _run_required(self, script: ScriptEntry, event_name: str, event: LifecycleEvent) -> None:
+        """Run a required command script; raise RequiredScriptError unless it succeeds."""
+        from apm_cli.core.script_executors import run_command_script
+
+        label = script.description or script.effective_command or "(no command)"
+        try:
+            outcome = run_command_script(
+                script,
+                event,
+                logger=self._logger,
+                verbose=self._verbose,
+                project_root=self._project_root,
+            )
+        except Exception as exc:
+            raise RequiredScriptError(
+                f"Required {event_name} script could not run: {label}"
+            ) from exc
+        if outcome.ok:
+            return
+        if outcome.status == "timeout":
+            reason = f"timed out after {script.effective_timeout}s"
+        elif outcome.exit_code is not None:
+            reason = f"exited with code {outcome.exit_code}"
+        else:
+            reason = "could not run"
+        message = f"Required {event_name} script {reason}: {label}"
+        detail = outcome.stderr.strip()
+        if detail:
+            message = f"{message}\n{detail}"
+        raise RequiredScriptError(message)
+
+    def has_skipped(self, event_name: str) -> bool:
+        """Whether a project script for event_name was skipped as untrusted."""
+        return any(s.event == event_name for s in self._skipped_entries)
 
     def scripts_for_event(self, event_name: str) -> list[ScriptEntry]:
         """Return scripts registered for event_name (public API)."""
@@ -612,10 +685,10 @@ def build_runner_from_context(
     project_trusted = is_fingerprint_trusted(project_yml, project_fp)
 
     kept: list[ScriptEntry] = []
-    skipped = 0
+    skipped_entries: list[ScriptEntry] = []
     for script in scripts:
         if script.source == "project" and not project_trusted:
-            skipped += 1
+            skipped_entries.append(script)
             continue
         kept.append(script)
 
@@ -624,6 +697,7 @@ def build_runner_from_context(
         logger=logger,
         verbose=verbose,
         project_root=project_root,
-        skipped_project_scripts=skipped,
-        skipped_project_file=str(project_yml) if skipped else None,
+        skipped_project_scripts=len(skipped_entries),
+        skipped_project_file=str(project_yml) if skipped_entries else None,
+        skipped_entries=skipped_entries,
     )

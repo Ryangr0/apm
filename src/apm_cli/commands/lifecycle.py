@@ -114,6 +114,7 @@ def lifecycle(ctx: click.Context) -> None:
             "post-update",
             "pre-uninstall",
             "post-uninstall",
+            "pre-compile",
         ],
         case_sensitive=False,
     ),
@@ -130,6 +131,7 @@ def lifecycle_test(event: str, verbose: bool, execute: bool) -> None:
         LifecycleEvent,
         LifecycleScriptRunner,
         PackageInfo,
+        RequiredScriptError,
         _get_project_apm_yml,
         discover_scripts,
     )
@@ -159,7 +161,10 @@ def lifecycle_test(event: str, verbose: bool, execute: bool) -> None:
         _rich_echo(f"  Trust status: {trust_label}", style="dim")
         for entry in matching:
             target = _safe_token(entry.url or entry.effective_command or "(none)")
-            _rich_echo(f"  - {entry.script_type:8s} {target} ({entry.source})", style="dim")
+            required = ", required" if entry.required else ""
+            _rich_echo(
+                f"  - {entry.script_type:8s} {target} ({entry.source}{required})", style="dim"
+            )
         _rich_echo("")
         _rich_info("Re-run with --execute to actually run these scripts.", symbol="info")
         return
@@ -176,7 +181,11 @@ def lifecycle_test(event: str, verbose: bool, execute: bool) -> None:
         working_directory=project_root,
     )
 
-    threads = runner.fire(event, synthetic_event)
+    try:
+        threads = runner.fire(event, synthetic_event)
+    except RequiredScriptError as e:
+        _rich_error(str(e), symbol="error")
+        sys.exit(1)
 
     for t in threads:
         t.join(timeout=15)
@@ -501,6 +510,14 @@ def _validate_script_file(path: Path, source: str) -> list[str]:
                     errors.append(
                         f"{prefix}: command script needs 'bash', 'command', or 'run' field"
                     )
+
+            if "required" in entry:
+                if not isinstance(entry["required"], bool):
+                    errors.append(f"{prefix}: 'required' must be true or false")
+                elif script_type != "command":
+                    errors.append(f"{prefix}: 'required' applies only to command scripts")
+                elif not event_name.startswith("pre-"):
+                    errors.append(f"{prefix}: 'required' applies only to pre-* events")
 
             if script_type == "http":
                 url = entry.get("url")

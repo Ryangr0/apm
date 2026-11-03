@@ -29,6 +29,7 @@ import stat
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,6 +62,28 @@ _DEFAULT_COMMAND_TIMEOUT = 30
 # Command scripts slower than this (seconds) earn a visible warning, since
 # they run synchronously and delay the user-facing operation.
 _SLOW_SCRIPT_THRESHOLD_SEC = 5.0
+
+# How much of a failed required script's stderr the error message quotes.
+_REQUIRED_STDERR_TAIL_CHARS = 2000
+
+
+@dataclass(frozen=True)
+class CommandOutcome:
+    """How a command script ended.
+
+    status is ``ok`` (exit 0), ``error`` (non-zero exit, no command, or the
+    process could not start) or ``timeout``.  stderr holds the tail of the
+    script's standard error, for the message a failed required script raises.
+    """
+
+    status: str
+    exit_code: int | None = None
+    stderr: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
 
 # Pattern for $VAR or ${VAR} expansion in header values.
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -643,6 +666,24 @@ def execute_script(
     elif script.script_type == "command":
         _execute_command(script, event, logger=logger, verbose=verbose, project_root=project_root)
     return None
+
+
+def run_command_script(
+    script: ScriptEntry,
+    event: LifecycleEvent,
+    *,
+    logger: CommandLogger | None = None,
+    verbose: bool = False,
+    project_root: str | None = None,
+) -> CommandOutcome:
+    """Run a command script and report how it ended.
+
+    The runner uses this for ``required`` scripts, whose failure aborts the
+    operation; every other script goes through :func:`execute_script`.
+    """
+    return _execute_command(
+        script, event, logger=logger, verbose=verbose, project_root=project_root
+    )
 
 
 # -- HTTP executor ---------------------------------------------------------
@@ -1515,7 +1556,7 @@ def _execute_command(
     logger: CommandLogger | None = None,
     verbose: bool = False,
     project_root: str | None = None,
-) -> None:
+) -> CommandOutcome:
     """Execute a shell command with the event payload on stdin.
 
     Command scripts run synchronously (bounded by ``timeout``), unlike
@@ -1526,7 +1567,7 @@ def _execute_command(
     cmd = script.effective_command
     if not cmd:
         _logger.debug("Command script has no command string, skipping")
-        return
+        return CommandOutcome(status="error", stderr="no command configured")
 
     env = _build_script_env(script)
     timeout = script.effective_timeout
@@ -1580,6 +1621,11 @@ def _execute_command(
                     f"[!] Lifecycle command script took {elapsed:.1f}s "
                     "(command scripts run synchronously and delay the operation)."
                 )
+        return CommandOutcome(
+            status="ok" if returncode == 0 else "error",
+            exit_code=returncode,
+            stderr=_redact_secrets(stderr)[-_REQUIRED_STDERR_TAIL_CHARS:],
+        )
     except subprocess.TimeoutExpired:
         _logger.debug("Command script timed out: %s", cmd)
         _kill_process_group(proc)
@@ -1590,12 +1636,16 @@ def _execute_command(
                 warn(
                     f"[!] Lifecycle command script timed out after {script.effective_timeout}s: {cmd}"
                 )
+        return CommandOutcome(status="timeout")
     except Exception as exc:
         _logger.debug("Command script failed: %s", cmd, exc_info=True)
         _kill_process_group(proc)
         _append_to_script_log(event.event, "command", cmd, stderr=str(exc), status="error")
         if verbose and logger:
             logger.verbose_detail(f"[i] Lifecycle command script failed: {cmd}")
+        return CommandOutcome(
+            status="error", stderr=_redact_secrets(str(exc))[-_REQUIRED_STDERR_TAIL_CHARS:]
+        )
 
 
 def _signal_kill_group(proc: subprocess.Popen | None) -> None:

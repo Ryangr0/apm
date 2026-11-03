@@ -14,6 +14,7 @@ they remain meaningful even as the internal helpers are refactored.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -34,6 +35,9 @@ def apm_log_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _event(name: str = "post-install") -> LifecycleEvent:
     return LifecycleEvent.create(event=name, working_directory="/tmp")
+
+
+_PY = f'"{sys.executable}"'
 
 
 def _cmd(command: str, **kw) -> ScriptEntry:
@@ -82,6 +86,45 @@ class TestCommandExecutor:
         entry = _cmd(f'{sys.executable} -c "import time; time.sleep(5)"', timeout_sec=1)
         se.execute_script(entry, _event())
         assert "status=timeout" in apm_log_home.read_text()
+
+
+class TestRunCommandScript:
+    """run_command_script reports how a command ended, for required scripts."""
+
+    def test_success_is_ok(self, apm_log_home: Path) -> None:
+        outcome = se.run_command_script(_cmd("echo generated"), _event("pre-compile"))
+        assert outcome.ok
+        assert outcome.exit_code == 0
+
+    def test_nonzero_exit_reports_code_and_stderr(self, apm_log_home: Path) -> None:
+        outcome = se.run_command_script(
+            _cmd(f"{_PY} -c \"import sys; sys.stderr.write('no-artisan'); sys.exit(4)\""),
+            _event("pre-compile"),
+        )
+        assert outcome.status == "error"
+        assert outcome.exit_code == 4
+        assert "no-artisan" in outcome.stderr
+
+    def test_missing_command_is_an_error(self, apm_log_home: Path) -> None:
+        outcome = se.run_command_script(_cmd(""), _event("pre-compile"))
+        assert not outcome.ok
+
+    def test_stderr_secrets_are_redacted(
+        self, apm_log_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        secret = "s3cr3t-value-for-redaction"
+        monkeypatch.setenv("GEN_API_TOKEN", secret)
+        outcome = se.run_command_script(
+            _cmd(f"{_PY} -c \"import sys; sys.stderr.write('{secret}'); sys.exit(1)\""),
+            _event("pre-compile"),
+        )
+        assert secret not in outcome.stderr
+        assert "[REDACTED]" in outcome.stderr
+
+    def test_timeout_is_reported(self, apm_log_home: Path) -> None:
+        with patch.object(se, "_capture_bounded", side_effect=se.subprocess.TimeoutExpired("x", 1)):
+            outcome = se.run_command_script(_cmd("sleep 5", timeout_sec=1), _event("pre-compile"))
+        assert outcome.status == "timeout"
 
 
 # ---------------------------------------------------------------------------

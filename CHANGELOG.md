@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `apm compile` fires a `pre-compile` lifecycle event before it reads sources, so a project script can generate primitives under `.apm/` first. A command script on any `pre-*` event can set `required: true`: when it fails, times out, or is an untrusted project script, the operation stops with exit code 1 instead of continuing. (#3459)
+
 ## [0.35.0] - 2026-10-22
 
 ### Added

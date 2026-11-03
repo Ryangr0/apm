@@ -1,12 +1,12 @@
 ---
 title: "Lifecycle Scripts"
-description: "Run custom actions (shell commands, HTTP webhooks) at install, update, and uninstall time."
+description: "Run custom actions (shell commands, HTTP webhooks) at install, update, uninstall, and compile time."
 sidebar:
   order: 12
 ---
 
 APM supports **lifecycle scripts** -- custom actions that fire automatically
-at key moments during install, update, and uninstall operations. Scripts live
+at key moments during install, update, uninstall, and compile operations. Scripts live
 inside `apm.yml` under a `lifecycle:` key -- no separate config files to manage.
 
 ```yaml
@@ -23,7 +23,9 @@ Run `apm lifecycle init` to scaffold this block in the current project.
 Project scripts require explicit trust before they run: `apm lifecycle trust`.
 See the [CLI reference](../../reference/cli/lifecycle/) for all subcommands.
 
-A failing script never aborts the CLI operation. HTTP scripts dispatch in a
+A failing script never aborts the CLI operation, unless it is a command
+script on a `pre-*` event marked [`required: true`](#required-scripts).
+HTTP scripts dispatch in a
 background thread (fire-and-forget), while command scripts run synchronously
 and can delay the operation until they finish or their timeout elapses.
 
@@ -46,6 +48,7 @@ fleet-managed deployment.
 | `post-update`    | After a successful update completes  |
 | `pre-uninstall`  | Before uninstall begins              |
 | `post-uninstall` | After a successful uninstall         |
+| `pre-compile`    | Before `apm compile` reads sources; not on `--dry-run` or `--validate` |
 
 ## Script file format
 
@@ -123,7 +126,52 @@ Fields:
 - `env` -- extra environment variables merged into the process env
 - `timeoutSec` -- execution timeout (default: 30s)
 
+- `required` -- (optional, `pre-*` events only) stop the operation when the
+  script fails; see [Required scripts](#required-scripts)
+
 If both `bash` and `command` are present, `bash` takes priority.
+
+### Required scripts
+
+By default a failing script is isolated: the operation continues. A command
+script on a `pre-*` event can set `required: true` instead. The operation then
+stops with exit code 1, before it changes anything, when the script:
+
+- exits non-zero, times out, or cannot start (the error quotes the end of its
+  stderr, with credential values redacted);
+- is a project script that is not trusted. Review the `lifecycle:` block and
+  run `apm lifecycle trust`, or skip all scripts with `APM_NO_SCRIPTS=1`.
+
+`APM_NO_SCRIPTS=1` and org policy `executables.deny_all: true` still suppress
+required scripts: both are explicit decisions to run no scripts. Scripts after
+a failed required script do not run. `apm lifecycle validate` rejects
+`required` on HTTP scripts and `post-*` events, and a value other than `true`
+or `false`.
+
+### Generating sources before compile
+
+Some toolchains compose agent guidance from the project's own dependencies.
+A required `pre-compile` script runs such a generator, writes its output under
+`.apm/`, and `apm compile` reads it like any other primitive. Laravel Boost,
+for example, composes the guidelines that installed Composer packages ship:
+
+```yaml
+lifecycle:
+  pre-compile:
+    - type: command
+      description: "Compose Laravel guidelines"
+      run: "php artisan boost:install --guidelines -n"
+      cwd: "apps/backend"
+      timeoutSec: 120
+      required: true
+```
+
+Configure the generator to write into a source file such as
+`.apm/instructions/laravel-boost.instructions.md`, not into `AGENTS.md` or
+`CLAUDE.md`, which compile owns. In CI, run `apm lifecycle trust` before
+`apm compile`, or the required script stops the job as untrusted. To deploy the
+generated file to targets that `apm install` serves, add the same entry under
+`pre-install`.
 
 ### HTTP
 

@@ -160,6 +160,40 @@ class TestValidateScriptFile:
         )
         assert _validate_script_file(f, "project") == []
 
+    def test_required_pre_compile_command_is_valid(self, tmp_path):
+        f = _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"pre-compile": [{"run": "gen", "required": True}]}},
+        )
+        assert _validate_script_file(f, "project") == []
+
+    def test_required_must_be_boolean(self, tmp_path):
+        f = _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"pre-compile": [{"run": "gen", "required": "yes"}]}},
+        )
+        assert _validate_script_file(f, "project") == [
+            "pre-compile[0]: 'required' must be true or false"
+        ]
+
+    def test_required_rejected_on_http_script(self, tmp_path):
+        f = _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"pre-install": [{"url": "https://example.com/h", "required": True}]}},
+        )
+        assert _validate_script_file(f, "project") == [
+            "pre-install[0]: 'required' applies only to command scripts"
+        ]
+
+    def test_required_rejected_on_post_event(self, tmp_path):
+        f = _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"post-install": [{"run": "x", "required": True}]}},
+        )
+        assert _validate_script_file(f, "project") == [
+            "post-install[0]: 'required' applies only to pre-* events"
+        ]
+
 
 class TestLifecycleTrustUntrust:
     def test_trust_nonexistent_file(self, cli_runner, tmp_path, monkeypatch):

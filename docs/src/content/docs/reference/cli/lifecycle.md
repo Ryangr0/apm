@@ -99,7 +99,7 @@ apm lifecycle test pre-install -v         # verbose dry-run
 | `--verbose`, `-v` | Show detailed output per script. |
 
 Supported events: `pre-install`, `post-install`, `pre-update`, `post-update`,
-`pre-uninstall`, `post-uninstall`. Default: `post-install`.
+`pre-uninstall`, `post-uninstall`, `pre-compile`. Default: `post-install`.
 
 Note: `apm lifecycle test` bypasses the project-script trust gate -- it is an
 explicit developer inspection tool for their own repository.

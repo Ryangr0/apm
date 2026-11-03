@@ -16,6 +16,7 @@ from apm_cli.core.lifecycle_scripts import (
     LifecycleEvent,
     LifecycleScriptRunner,
     PackageInfo,
+    RequiredScriptError,
     ScriptEntry,
     _entries_from_lifecycle_map,
     _get_policy_scripts_dir,
@@ -156,6 +157,50 @@ class TestParseApmYmlLifecycle:
         assert parse_project_script_file(path) == parse_apm_yml_lifecycle(path, "project")
 
 
+class TestRequiredField:
+    def test_required_true_on_pre_event_command(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"pre-compile": [{"type": "command", "run": "gen", "required": True}]}},
+        )
+        assert parse_apm_yml_lifecycle(path, "project")[0].required is True
+
+    def test_required_defaults_to_false(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"pre-compile": [{"type": "command", "run": "gen"}]}},
+        )
+        assert parse_apm_yml_lifecycle(path, "project")[0].required is False
+
+    @pytest.mark.parametrize("value", ["true", 1, "yes"])
+    def test_required_accepts_only_boolean_true(self, tmp_path: Path, value: object) -> None:
+        path = _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"pre-compile": [{"type": "command", "run": "gen", "required": value}]}},
+        )
+        assert parse_apm_yml_lifecycle(path, "project")[0].required is False
+
+    def test_required_ignored_on_post_event(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"post-install": [{"type": "command", "run": "x", "required": True}]}},
+        )
+        assert parse_apm_yml_lifecycle(path, "project")[0].required is False
+
+    def test_required_ignored_on_http_script(self, tmp_path: Path) -> None:
+        path = _write_yaml(
+            tmp_path / "apm.yml",
+            {
+                "lifecycle": {
+                    "pre-install": [
+                        {"type": "http", "url": "https://example.com/hook", "required": True}
+                    ]
+                }
+            },
+        )
+        assert parse_apm_yml_lifecycle(path, "project")[0].required is False
+
+
 @pytest.mark.windows_compat
 class TestGetPolicyScriptsDir:
     def test_windows_honours_programdata_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -283,6 +328,111 @@ class TestLifecycleScriptRunner:
             runner.fire("post-install", self._make_event())
         assert call_count == 2
 
+    def test_required_failure_raises_and_stops_later_scripts(self) -> None:
+        from apm_cli.core.script_executors import CommandOutcome
+
+        required = ScriptEntry(
+            script_type="command", event="pre-compile", bash="gen", required=True
+        )
+        later = ScriptEntry(script_type="command", event="pre-compile", bash="later")
+        runner = LifecycleScriptRunner(scripts=[required, later])
+        failed = CommandOutcome(status="error", exit_code=3, stderr="composer.json missing")
+        with (
+            patch("apm_cli.core.script_executors.run_command_script", return_value=failed),
+            patch("apm_cli.core.script_executors.execute_script") as mock_exec,
+            pytest.raises(RequiredScriptError, match="exited with code 3: gen"),
+        ):
+            runner.fire("pre-compile", self._make_event("pre-compile"))
+        mock_exec.assert_not_called()
+
+    def test_required_failure_quotes_stderr(self) -> None:
+        from apm_cli.core.script_executors import CommandOutcome
+
+        required = ScriptEntry(
+            script_type="command", event="pre-compile", bash="gen", required=True
+        )
+        runner = LifecycleScriptRunner(scripts=[required])
+        failed = CommandOutcome(status="error", exit_code=1, stderr="composer.json missing\n")
+        with (
+            patch("apm_cli.core.script_executors.run_command_script", return_value=failed),
+            pytest.raises(RequiredScriptError) as raised,
+        ):
+            runner.fire("pre-compile", self._make_event("pre-compile"))
+        assert str(raised.value).endswith("composer.json missing")
+
+    def test_required_timeout_raises(self) -> None:
+        from apm_cli.core.script_executors import CommandOutcome
+
+        required = ScriptEntry(
+            script_type="command",
+            event="pre-compile",
+            bash="gen",
+            required=True,
+            timeout_sec=5,
+            description="Compose Boost guidelines",
+        )
+        runner = LifecycleScriptRunner(scripts=[required])
+        with (
+            patch(
+                "apm_cli.core.script_executors.run_command_script",
+                return_value=CommandOutcome(status="timeout"),
+            ),
+            pytest.raises(RequiredScriptError, match="timed out after 5s: Compose Boost"),
+        ):
+            runner.fire("pre-compile", self._make_event("pre-compile"))
+
+    def test_required_executor_exception_raises(self) -> None:
+        required = ScriptEntry(
+            script_type="command", event="pre-install", bash="gen", required=True
+        )
+        runner = LifecycleScriptRunner(scripts=[required])
+        with (
+            patch(
+                "apm_cli.core.script_executors.run_command_script",
+                side_effect=RuntimeError("boom"),
+            ),
+            pytest.raises(RequiredScriptError, match="could not run: gen"),
+        ):
+            runner.fire("pre-install", self._make_event("pre-install"))
+
+    def test_required_success_continues(self) -> None:
+        from apm_cli.core.script_executors import CommandOutcome
+
+        required = ScriptEntry(
+            script_type="command", event="pre-compile", bash="gen", required=True
+        )
+        later = ScriptEntry(script_type="command", event="pre-compile", bash="later")
+        runner = LifecycleScriptRunner(scripts=[required, later])
+        with (
+            patch(
+                "apm_cli.core.script_executors.run_command_script",
+                return_value=CommandOutcome(status="ok", exit_code=0),
+            ),
+            patch("apm_cli.core.script_executors.execute_script") as mock_exec,
+        ):
+            runner.fire("pre-compile", self._make_event("pre-compile"))
+        mock_exec.assert_called_once()
+
+    def test_untrusted_required_script_raises(self) -> None:
+        skipped = ScriptEntry(script_type="command", event="pre-compile", bash="gen", required=True)
+        runner = LifecycleScriptRunner(
+            scripts=[],
+            skipped_project_scripts=1,
+            skipped_project_file="/repo/apm.yml",
+            skipped_entries=[skipped],
+        )
+        with pytest.raises(RequiredScriptError, match="apm lifecycle trust"):
+            runner.fire("pre-compile", self._make_event("pre-compile"))
+
+    def test_untrusted_required_script_for_other_event_does_not_raise(self) -> None:
+        skipped = ScriptEntry(script_type="command", event="pre-install", bash="gen", required=True)
+        runner = LifecycleScriptRunner(
+            scripts=[], skipped_project_scripts=1, skipped_entries=[skipped]
+        )
+        assert runner.fire("pre-compile", self._make_event("pre-compile")) == []
+        assert runner.has_skipped("pre-install")
+        assert not runner.has_skipped("pre-compile")
+
     def test_scripts_for_event_filters(self) -> None:
         s1 = ScriptEntry(script_type="command", event="post-install", bash="echo a")
         s2 = ScriptEntry(script_type="http", event="pre-install", url="https://x.com")
@@ -343,6 +493,32 @@ class TestBuildRunnerFromContext:
         assert runner._scripts == []
         assert runner._skipped_project_scripts == 1
 
+    def test_untrusted_required_project_script_is_recorded(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("APM_NO_SCRIPTS", raising=False)
+        _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"pre-compile": [{"run": "gen", "required": True}]}},
+        )
+        with (
+            patch("apm_cli.core.script_trust.is_fingerprint_trusted", return_value=False),
+            patch("apm_cli.policy.discovery.discover_policy_with_chain", return_value=None),
+        ):
+            runner = build_runner_from_context(project_root=str(tmp_path))
+        assert runner.has_skipped("pre-compile")
+        with pytest.raises(RequiredScriptError):
+            runner.fire("pre-compile", LifecycleEvent.create(event="pre-compile"))
+
+    def test_apm_no_scripts_skips_required_scripts(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("APM_NO_SCRIPTS", "1")
+        _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"pre-compile": [{"run": "gen", "required": True}]}},
+        )
+        runner = build_runner_from_context(project_root=str(tmp_path))
+        assert runner.fire("pre-compile", LifecycleEvent.create(event="pre-compile")) == []
+
     def test_trusted_project_scripts_are_included(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.delenv("APM_NO_SCRIPTS", raising=False)
         _write_yaml(
@@ -380,6 +556,7 @@ class TestConstants:
             "post-update",
             "pre-uninstall",
             "post-uninstall",
+            "pre-compile",
         }
 
     def test_script_types_tuple(self) -> None:

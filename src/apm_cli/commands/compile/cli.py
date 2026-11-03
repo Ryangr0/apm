@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from ...compilation import AgentsCompiler, CompilationConfig
 from ...constants import AGENTS_MD_FILENAME, APM_DIR, APM_MODULES_DIR, APM_YML_FILENAME
 from ...core.command_logger import CommandLogger
+from ...core.lifecycle_scripts import RequiredScriptError
 from ...core.target_catalog import (
     TARGET_CAPABILITIES,
     expand_all,
@@ -572,6 +573,38 @@ def _display_user_path(path: Path) -> str:
     except ValueError:
         return str(path)
     return f"~/{rel.as_posix()}"
+
+
+def _fire_pre_compile(logger: CommandLogger, verbose: bool, source_root: Path) -> None:
+    """Fire the ``pre-compile`` lifecycle event before sources are read.
+
+    Scripts on this event can generate primitives under ``.apm/`` from the
+    project's own toolchain, so compile reads what they wrote.  A failed
+    required script raises :class:`RequiredScriptError`.
+    """
+    from ...core.lifecycle_scripts import LifecycleEvent, PackageInfo, build_runner_from_context
+    from ...models.apm_package import APMPackage
+
+    project_root = str(source_root)
+    runner = build_runner_from_context(logger=logger, verbose=verbose, project_root=project_root)
+    if not runner.scripts_for_event("pre-compile") and not runner.has_skipped("pre-compile"):
+        return
+    try:
+        dependencies = APMPackage.from_apm_yml(
+            source_root / APM_YML_FILENAME
+        ).get_apm_dependencies()
+    except Exception:
+        dependencies = []
+    event = LifecycleEvent.create(
+        event="pre-compile",
+        packages=[
+            PackageInfo(name=dep.repo_url or str(dep), reference=dep.reference)
+            for dep in dependencies
+        ],
+        scope="project",
+        working_directory=project_root,
+    )
+    runner.fire("pre-compile", event)
 
 
 def _validate_project(
@@ -1425,6 +1458,11 @@ def compile(  # noqa: PLR0913 -- Click handler
         # from. Equals $PWD unless --root redirects writes elsewhere.
         source_root = get_source_root(InstallScope.PROJECT)
 
+        # Generators run before validation so a first compile can find
+        # what they write; dry-run and --validate promise no writes.
+        if not dry_run and not validate and (source_root / APM_YML_FILENAME).exists():
+            _fire_pre_compile(logger, verbose, source_root)
+
         _validate_project(
             logger,
             dry_run,
@@ -1466,6 +1504,9 @@ def compile(  # noqa: PLR0913 -- Click handler
             source_root=source_root,
         )
 
+    except RequiredScriptError as e:
+        logger.error(str(e))
+        sys.exit(1)
     except ImportError as e:
         logger.error(f"Compilation module not available: {e}")
         logger.progress("This might be a development environment issue.")
