@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import sys
 from pathlib import Path
@@ -25,7 +26,7 @@ from ...core.target_catalog import (
     target_help_fragment,
 )
 from ...core.target_detection import TargetParamType, should_compile_agents_md
-from ...install.locking import serialized_lifecycle_unless
+from ...install.locking import lifecycle_operation, serialized_lifecycle_unless
 from ...primitives.discovery import clear_discovery_cache, discover_primitives
 from ...utils import perf_stats
 from ...utils.console import (
@@ -1453,15 +1454,24 @@ def compile(  # noqa: PLR0913 -- Click handler
 
     _root_redirect = compile_root_redirect(root, dry_run=dry_run)
     _root_redirect.__enter__()
+    # Holds the lifecycle lock from pre-compile scripts through compilation,
+    # so no other APM process mutates state between generation and reading.
+    _pre_compile_lock = contextlib.ExitStack()
     try:
         # Source root: where apm.yml, .apm/, and the project tree are read
         # from. Equals $PWD unless --root redirects writes elsewhere.
         source_root = get_source_root(InstallScope.PROJECT)
 
         # Generators run before validation so a first compile can find
-        # what they write; dry-run and --validate promise no writes.
+        # what they write; dry-run and --validate promise no writes. Watch
+        # mode takes the lock only while the scripts run, not for its session.
         if not dry_run and not validate and (source_root / APM_YML_FILENAME).exists():
-            _fire_pre_compile(logger, verbose, source_root)
+            if watch:
+                with lifecycle_operation():
+                    _fire_pre_compile(logger, verbose, source_root)
+            else:
+                _pre_compile_lock.enter_context(lifecycle_operation())
+                _fire_pre_compile(logger, verbose, source_root)
 
         _validate_project(
             logger,
@@ -1517,6 +1527,7 @@ def compile(  # noqa: PLR0913 -- Click handler
         logger.error(f"Error during compilation: {e}")
         sys.exit(1)
     finally:
+        _pre_compile_lock.close()
         # Restore cwd + clear the source-root override regardless of how
         # the handler exits (return, sys.exit -> SystemExit, exception).
         _root_redirect.__exit__(None, None, None)
