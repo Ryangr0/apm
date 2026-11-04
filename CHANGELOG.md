@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `apm compile` fires a `pre-compile` lifecycle event before it reads sources, so a trusted project script can generate instructions under `.apm/` first. -- by @Ryangr0 (#3459)
+
 ## [0.35.0] - 2026-10-22
 
 ### Added
