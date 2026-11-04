@@ -18,6 +18,8 @@ from click.testing import CliRunner
 
 from apm_cli.cli import cli
 
+pytestmark = [pytest.mark.component, pytest.mark.windows_compat]
+
 GENERATOR = """\
 from pathlib import Path
 import sys
@@ -111,3 +113,56 @@ def test_apm_no_scripts_skips_required_scripts(isolated: Path, monkeypatch) -> N
     assert result.exit_code == 0, result.output
     assert not (project / "generator-ran").exists()
     assert "Committed guidance." in (project / "AGENTS.md").read_text()
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [("--validate",), ("--root", "out")],
+    ids=["validate", "root"],
+)
+def test_read_only_and_redirected_modes_run_no_scripts(
+    isolated: Path, monkeypatch, flags: tuple[str, ...]
+) -> None:
+    project = _project(isolated)
+    instructions = project / ".apm" / "instructions"
+    instructions.mkdir(parents=True)
+    (instructions / "kept.instructions.md").write_text(
+        '---\napplyTo: "**"\ndescription: kept\n---\nCommitted guidance.\n'
+    )
+    _compile(project, monkeypatch, *flags)
+    assert not (project / "generator-ran").exists()
+
+
+def test_watch_mode_runs_no_scripts(isolated: Path, monkeypatch) -> None:
+    project = _project(isolated)
+    instructions = project / ".apm" / "instructions"
+    instructions.mkdir(parents=True)
+    (instructions / "kept.instructions.md").write_text('---\napplyTo: "**"\n---\nKept.\n')
+    with patch("apm_cli.commands.compile.cli._watch_mode") as watch:
+        result = _compile(project, monkeypatch, "--watch")
+    assert result.exit_code == 0, result.output
+    watch.assert_called_once()
+    assert not (project / "generator-ran").exists()
+
+
+LOCK_PROBE = """\
+from pathlib import Path
+from filelock import FileLock, Timeout
+
+try:
+    FileLock(str(Path.home() / ".apm" / ".apm-lifecycle.lock")).acquire(timeout=0)
+    state = "free"
+except Timeout:
+    state = "held"
+Path("lock-state").write_text(state)
+"""
+
+
+def test_scripts_run_under_the_lifecycle_lock(isolated: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(isolated / "home"))
+    monkeypatch.setenv("USERPROFILE", str(isolated / "home"))
+    project = _project(isolated)
+    (project / "gen.py").write_text(LOCK_PROBE + GENERATOR)
+    result = _compile(project, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert (project / "lock-state").read_text() == "held"

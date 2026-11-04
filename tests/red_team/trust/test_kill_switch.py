@@ -108,3 +108,52 @@ def test_lifecycle_test_execute_bypasses_gate_by_design(
     matching = runner.scripts_for_event("post-install")
     assert matching, "lifecycle test --execute must see untrusted project scripts"
     assert any(s.source == "project" for s in matching)
+
+
+REQUIRED_YML = (
+    "lifecycle:\n  pre-compile:\n    - type: command\n      bash: exit 7\n      required: true\n"
+)
+
+
+def _required_project(tmp_path: Path) -> Path:
+    project = tmp_path / "required"
+    project.mkdir()
+    (project / "apm.yml").write_text(REQUIRED_YML, encoding="utf-8")
+    return project
+
+
+def _pre_compile_event():
+    from apm_cli.core.lifecycle_scripts import LifecycleEvent
+
+    return LifecycleEvent.create(event="pre-compile", working_directory="/tmp")
+
+
+@pytest.mark.usefixtures("hermetic_sources")
+def test_apm_no_scripts_silences_untrusted_required_script(
+    apm_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kill switch wins over required: nothing runs and nothing raises."""
+    project = _required_project(tmp_path)
+    monkeypatch.setenv("APM_NO_SCRIPTS", "1")
+    runner = build_runner_from_context(project_root=str(project))
+    assert runner.fire("pre-compile", _pre_compile_event()) == []
+
+
+def test_org_deny_all_silences_untrusted_required_script(
+    apm_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """deny_all is applied before the untrusted-required check, so it cannot be forced to fail."""
+    project = _required_project(tmp_path)
+    monkeypatch.setattr(
+        "apm_cli.core.lifecycle_scripts._get_policy_scripts_dir",
+        lambda: tmp_path / "no_policy_dir",
+    )
+    deny_result = SimpleNamespace(
+        policy=SimpleNamespace(executables=SimpleNamespace(deny_all=True))
+    )
+    monkeypatch.setattr(
+        "apm_cli.policy.discovery.discover_policy_with_chain",
+        lambda *_a, **_k: deny_result,
+    )
+    runner = build_runner_from_context(project_root=str(project))
+    assert runner.fire("pre-compile", _pre_compile_event()) == []

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import sys
 from pathlib import Path
@@ -17,7 +16,7 @@ if TYPE_CHECKING:
 from ...compilation import AgentsCompiler, CompilationConfig
 from ...constants import AGENTS_MD_FILENAME, APM_DIR, APM_MODULES_DIR, APM_YML_FILENAME
 from ...core.command_logger import CommandLogger
-from ...core.lifecycle_scripts import RequiredScriptError
+from ...core.lifecycle_scripts import RequiredScriptError, report_required_script_error
 from ...core.target_catalog import (
     TARGET_CAPABILITIES,
     expand_all,
@@ -26,7 +25,7 @@ from ...core.target_catalog import (
     target_help_fragment,
 )
 from ...core.target_detection import TargetParamType, should_compile_agents_md
-from ...install.locking import lifecycle_operation, serialized_lifecycle_unless
+from ...install.locking import serialized_lifecycle_unless
 from ...primitives.discovery import clear_discovery_cache, discover_primitives
 from ...utils import perf_stats
 from ...utils.console import (
@@ -583,29 +582,34 @@ def _fire_pre_compile(logger: CommandLogger, verbose: bool, source_root: Path) -
     project's own toolchain, so compile reads what they wrote.  A failed
     required script raises :class:`RequiredScriptError`.
     """
-    from ...core.lifecycle_scripts import LifecycleEvent, PackageInfo, build_runner_from_context
+    from ...core.lifecycle_scripts import fire_lifecycle_event, packages_from_dependencies
     from ...models.apm_package import APMPackage
 
-    project_root = str(source_root)
-    runner = build_runner_from_context(logger=logger, verbose=verbose, project_root=project_root)
-    if not runner.scripts_for_event("pre-compile") and not runner.has_skipped("pre-compile"):
+    manifest = source_root / APM_YML_FILENAME
+    if not manifest.exists():
         return
     try:
-        dependencies = APMPackage.from_apm_yml(
-            source_root / APM_YML_FILENAME
-        ).get_apm_dependencies()
-    except Exception:
+        dependencies = APMPackage.from_apm_yml(manifest).get_apm_dependencies()
+    except (OSError, ValueError):
         dependencies = []
-    event = LifecycleEvent.create(
-        event="pre-compile",
-        packages=[
-            PackageInfo(name=dep.repo_url or str(dep), reference=dep.reference)
-            for dep in dependencies
-        ],
+    fire_lifecycle_event(
+        "pre-compile",
+        packages=packages_from_dependencies(dependencies),
         scope="project",
-        working_directory=project_root,
+        project_root=str(source_root),
+        logger=logger,
+        verbose=verbose,
     )
-    runner.fire("pre-compile", event)
+
+
+def _generate_sources(
+    logger: CommandLogger, verbose: bool, source_root: Path | None, *, clean: bool, run: bool
+) -> None:
+    """Run pre-compile scripts, then check the project they may have populated."""
+    if not run or source_root is None:
+        return
+    _fire_pre_compile(logger, verbose, source_root)
+    _validate_project(logger, False, source_root, allow_empty=clean)
 
 
 def _validate_project(
@@ -852,13 +856,21 @@ def _run_compilation(
     clean: bool,
     no_dedup: bool,
     source_root: Path | None = None,
+    *,
+    run_scripts: bool = False,
 ) -> None:
     """Main compilation flow: target resolution, config, compile, and output.
+
+    With ``run_scripts``, the ``pre-compile`` lifecycle event fires first and
+    the project check follows it, both under this function's lifecycle lock,
+    so what the scripts generate is what compile reads.
 
     Handles both distributed (default) and single-file (``--single-agents``)
     strategies, emits the canonical target-provenance line, runs the
     compiler, reports results, and hard-fails on critical security findings.
     """
+    _generate_sources(logger, verbose, source_root, clean=clean, run=run_scripts and not dry_run)
+
     from ...core.target_detection import (
         REASON_NO_TARGET_FOLDER,
         ResolvedTargets,
@@ -1454,31 +1466,23 @@ def compile(  # noqa: PLR0913 -- Click handler
 
     _root_redirect = compile_root_redirect(root, dry_run=dry_run)
     _root_redirect.__enter__()
-    # Holds the lifecycle lock from pre-compile scripts through compilation,
-    # so no other APM process mutates state between generation and reading.
-    _pre_compile_lock = contextlib.ExitStack()
     try:
         # Source root: where apm.yml, .apm/, and the project tree are read
         # from. Equals $PWD unless --root redirects writes elsewhere.
         source_root = get_source_root(InstallScope.PROJECT)
 
-        # Generators run before validation so a first compile can find
-        # what they write; dry-run and --validate promise no writes. Watch
-        # mode takes the lock only while the scripts run, not for its session.
-        if not dry_run and not validate and (source_root / APM_YML_FILENAME).exists():
-            if watch:
-                with lifecycle_operation():
-                    _fire_pre_compile(logger, verbose, source_root)
-            else:
-                _pre_compile_lock.enter_context(lifecycle_operation())
-                _fire_pre_compile(logger, verbose, source_root)
-
-        _validate_project(
-            logger,
-            dry_run,
-            source_root,
-            allow_empty=clean and not validate and not watch,
-        )
+        # pre-compile scripts run inside _run_compilation, which checks the
+        # project after them so a first compile finds what they generate.
+        # --validate, --watch and --dry-run run no scripts, and neither does
+        # --root, which promises to write only under its directory.
+        run_scripts = not validate and not watch and not dry_run and not root
+        if not run_scripts:
+            _validate_project(
+                logger,
+                dry_run,
+                source_root,
+                allow_empty=clean and not validate and not watch,
+            )
 
         if validate:
             _run_validation_mode(logger, verbose, source_root)
@@ -1512,10 +1516,11 @@ def compile(  # noqa: PLR0913 -- Click handler
             clean,
             no_dedup,
             source_root=source_root,
+            run_scripts=run_scripts,
         )
 
     except RequiredScriptError as e:
-        logger.error(str(e))
+        report_required_script_error(e, logger, verbose=verbose)
         sys.exit(1)
     except ImportError as e:
         logger.error(f"Compilation module not available: {e}")
@@ -1527,7 +1532,6 @@ def compile(  # noqa: PLR0913 -- Click handler
         logger.error(f"Error during compilation: {e}")
         sys.exit(1)
     finally:
-        _pre_compile_lock.close()
         # Restore cwd + clear the source-root override regardless of how
         # the handler exits (return, sys.exit -> SystemExit, exception).
         _root_redirect.__exit__(None, None, None)

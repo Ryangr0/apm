@@ -637,6 +637,7 @@ install-deployment-local-bundle-policy-preflight
 install-deployment-local-identity-anchor
 install-deployment-skill-preflight
 install-deployment-locked-skill-subset-reconstruction
+install-deployment-lifecycle-event-firing
 install-deployment-lsp-lifecycle
 install-deployment-lsp-target-contract
 install-deployment-manifest-inheritance-includes

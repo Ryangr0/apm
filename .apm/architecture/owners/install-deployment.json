@@ -181,6 +181,13 @@
       "guards": ["install-deployment-lsp-target-contract"]
     },
     {
+      "id": "lifecycle-event-firing",
+      "decision": "Lifecycle event firing, payload packages, and required-script failure rendering",
+      "owner": "core/lifecycle_scripts.py (fire_lifecycle_event, packages_from_dependencies, report_required_script_error)",
+      "selectors": ["src/apm_cli/core/lifecycle_scripts.py"],
+      "guards": ["install-deployment-lifecycle-event-firing"]
+    },
+    {
       "id": "lsp-lifecycle",
       "decision": "LSP lifecycle orchestration and reconciliation",
       "owner": "install/lsp/integration.py",

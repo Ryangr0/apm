@@ -91,40 +91,53 @@ class TestCommandExecutor:
 class TestRunCommandScript:
     """run_command_script reports how a command ended, for required scripts."""
 
+    @staticmethod
+    def _stderr(text: str) -> str:
+        return f'{_PY} -c "import sys; sys.stderr.write({text!r}); sys.exit(4)"'
+
     def test_success_is_ok(self, apm_log_home: Path) -> None:
         outcome = se.run_command_script(_cmd("echo generated"), _event("pre-compile"))
         assert outcome.ok
         assert outcome.exit_code == 0
 
     def test_nonzero_exit_reports_code_and_stderr(self, apm_log_home: Path) -> None:
-        outcome = se.run_command_script(
-            _cmd(f"{_PY} -c \"import sys; sys.stderr.write('no-artisan'); sys.exit(4)\""),
-            _event("pre-compile"),
-        )
+        outcome = se.run_command_script(_cmd(self._stderr("no artisan")), _event("pre-compile"))
         assert outcome.status == "error"
         assert outcome.exit_code == 4
-        assert "no-artisan" in outcome.stderr
+        assert outcome.stderr_lines == ("no artisan",)
 
     def test_missing_command_is_an_error(self, apm_log_home: Path) -> None:
         outcome = se.run_command_script(_cmd(""), _event("pre-compile"))
-        assert not outcome.ok
+        assert outcome.status == "error"
+
+    def test_stderr_is_reduced_to_printable_ascii(self, apm_log_home: Path) -> None:
+        text = "\x1b]0;title\x07\x1b[2Kfake \u2713 line"
+        outcome = se.run_command_script(_cmd(self._stderr(text)), _event("pre-compile"))
+        assert outcome.stderr_lines == ("?]0;title??[2Kfake ? line",)
+
+    def test_stderr_keeps_only_the_tail(self, apm_log_home: Path) -> None:
+        text = "\n".join(f"line {n}" for n in range(30))
+        outcome = se.run_command_script(_cmd(self._stderr(text)), _event("pre-compile"))
+        assert outcome.stderr_lines[0] == "line 10"
+        assert len(outcome.stderr_lines) == 20
 
     def test_stderr_secrets_are_redacted(
         self, apm_log_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        secret = "s3cr3t-value-for-redaction"
-        monkeypatch.setenv("GEN_API_TOKEN", secret)
-        outcome = se.run_command_script(
-            _cmd(f"{_PY} -c \"import sys; sys.stderr.write('{secret}'); sys.exit(1)\""),
-            _event("pre-compile"),
-        )
-        assert secret not in outcome.stderr
-        assert "[REDACTED]" in outcome.stderr
+        monkeypatch.setenv("GEN_API_TOKEN", "s3cr3t-value-for-redaction")
+        text = "s3cr3t-value-for-redaction own-env-secret-1 postgres://app:pw@db/x"
+        script = _cmd(self._stderr(text), env={"OWN": "own-env-secret-1"})
+        outcome = se.run_command_script(script, _event("pre-compile"))
+        assert outcome.stderr_lines == ("[REDACTED] [REDACTED] postgres://[REDACTED]@db/x",)
 
-    def test_timeout_is_reported(self, apm_log_home: Path) -> None:
+    def test_timeout_is_reported_without_warning(self, apm_log_home: Path) -> None:
+        logger = MagicMock()
         with patch.object(se, "_capture_bounded", side_effect=se.subprocess.TimeoutExpired("x", 1)):
-            outcome = se.run_command_script(_cmd("sleep 5", timeout_sec=1), _event("pre-compile"))
+            outcome = se.run_command_script(
+                _cmd("slow", timeout_sec=1), _event("pre-compile"), logger=logger
+            )
         assert outcome.status == "timeout"
+        logger.warning.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

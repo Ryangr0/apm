@@ -46,6 +46,8 @@ from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from apm_cli.core.command_logger import CommandLogger
 
 _logger = logging.getLogger(__name__)
@@ -68,8 +70,40 @@ SCRIPT_TYPES = ("command", "http")
 SCRIPT_FILE_VERSION = 1
 
 
-class RequiredScriptError(Exception):
-    """A script marked ``required: true`` did not succeed, so the operation stops."""
+def is_pre_event(event_name: str) -> bool:
+    """Whether event_name fires before its operation changes anything."""
+    return event_name in LIFECYCLE_EVENTS and event_name.startswith("pre-")
+
+
+class RequiredScriptError(RuntimeError):
+    """A script marked ``required: true`` did not succeed, so the operation stops.
+
+    ``str()`` is the one-line summary. ``detail`` holds the sanitised tail of
+    the script's stderr, shown only with ``--verbose`` because it is
+    script-controlled text.
+    """
+
+    def __init__(self, summary: str, detail: tuple[str, ...] = ()) -> None:
+        super().__init__(summary)
+        self.detail = detail
+
+
+def required_issue(raw: dict, script_type: str, event_name: str) -> str | None:
+    """Describe what is wrong with an entry's ``required`` field, or None.
+
+    The single owner of the rule shared by the runtime and
+    ``apm lifecycle validate``: ``required`` must be a boolean, and applies
+    only to command scripts on pre-* events.
+    """
+    if "required" not in raw:
+        return None
+    if not isinstance(raw["required"], bool):
+        return "'required' must be true or false"
+    if script_type != "command":
+        return "'required' applies only to command scripts"
+    if not is_pre_event(event_name):
+        return "'required' applies only to pre-* events"
+    return None
 
 
 # -- Event model -----------------------------------------------------------
@@ -148,6 +182,10 @@ class ScriptEntry:
         required:    When true (command scripts on pre-* events only), a
                      failure, timeout, or untrusted skip aborts the
                      operation before it starts instead of being isolated.
+        required_issue: Why the entry's ``required`` field is invalid, or
+                     None.  A non-boolean value on a pre-* command script
+                     stops the operation; other misuse is ignored with a
+                     warning.
         source:      Where this script was defined: policy, user, or project.
         source_file: Path of the file that declared this script.
     """
@@ -164,6 +202,7 @@ class ScriptEntry:
     allowed_env_vars: list[str] | None = None
     description: str | None = None
     required: bool = False
+    required_issue: str | None = None
     source: str = "project"
     source_file: str | None = None
 
@@ -214,6 +253,7 @@ def _build_entry(raw: object, event_name: str, path: Path, source: str) -> Scrip
     run_val = raw.get("run")
     bash_val = raw.get("bash") or (run_val if run_val and not raw.get("bash") else None)
     command_val = raw.get("command") or (run_val if run_val and not raw.get("command") else None)
+    issue = required_issue(raw, script_type, event_name)
     return ScriptEntry(
         script_type=script_type,
         event=event_name,
@@ -226,11 +266,8 @@ def _build_entry(raw: object, event_name: str, path: Path, source: str) -> Scrip
         env=raw.get("env"),
         allowed_env_vars=_parse_allowed_env_vars(raw.get("allowedEnvVars")),
         description=raw.get("description"),
-        required=(
-            script_type == "command"
-            and event_name.startswith("pre-")
-            and raw.get("required") is True
-        ),
+        required=issue is None and raw.get("required") is True,
+        required_issue=issue,
         source=source,
         source_file=str(path),
     )
@@ -471,24 +508,57 @@ class LifecycleScriptRunner:
         self._skipped_project_file = skipped_project_file
         self._skip_notice_emitted = False
 
-    def _emit_skip_notice(self) -> None:
-        """Warn once that untrusted project scripts were skipped."""
-        if self._skip_notice_emitted or self._skipped_project_scripts <= 0:
-            return
-        self._skip_notice_emitted = True
-        count = self._skipped_project_scripts
-        msg = (
-            f"[!] Skipped {count} untrusted project script(s). "
-            "Run 'apm lifecycle trust' to enable them."
-        )
+    def _warn(self, message: str) -> None:
         if self._logger is not None:
             emit = getattr(self._logger, "warning", None) or getattr(
                 self._logger, "verbose_detail", None
             )
             if emit is not None:
-                emit(msg)
-        else:
-            _logger.warning("%s", msg)
+                emit(message)
+                return
+        _logger.warning("%s", message)
+
+    def _skipped_count(self, event_name: str) -> int:
+        """Untrusted project scripts skipped for event_name.
+
+        Runners built by discovery record the skipped entries; a runner
+        constructed with only a count reports that count for any event.
+        """
+        if self._skipped_entries:
+            return sum(1 for s in self._skipped_entries if s.event == event_name)
+        return self._skipped_project_scripts
+
+    def _emit_skip_notice(self, event_name: str) -> None:
+        """Warn once that untrusted project scripts for event_name were skipped."""
+        count = self._skipped_count(event_name)
+        if self._skip_notice_emitted or count <= 0:
+            return
+        self._skip_notice_emitted = True
+        self._warn(
+            f"Skipped {count} untrusted project script(s) for {event_name}. "
+            "Run 'apm lifecycle trust' to enable them."
+        )
+
+    def _check_required_entries(self, event_name: str) -> None:
+        """Stop before any script runs when a required entry cannot run as declared."""
+        untrusted = [s for s in self._skipped_entries if s.required and s.event == event_name]
+        if untrusted:
+            raise RequiredScriptError(
+                f"{len(untrusted)} required {event_name} script(s) in "
+                f"{self._skipped_project_file or 'apm.yml'} are not trusted. Review the "
+                "lifecycle: block, then run 'apm lifecycle trust' to allow it on this "
+                "machine, or set APM_NO_SCRIPTS=1 to run no lifecycle scripts."
+            )
+        for script in self._scripts:
+            if script.event != event_name or script.required_issue is None:
+                continue
+            location = script.source_file or script.source
+            if script.script_type == "command" and is_pre_event(event_name):
+                raise RequiredScriptError(
+                    f"Invalid {event_name} script in {location}: {script.required_issue}. "
+                    "Run 'apm lifecycle validate'."
+                )
+            self._warn(f"{event_name} script in {location}: {script.required_issue}; ignored.")
 
     def fire(self, event_name: str, event: LifecycleEvent) -> list[threading.Thread]:
         """Execute all scripts registered for event_name.
@@ -501,21 +571,14 @@ class LifecycleScriptRunner:
 
         Raises:
             RequiredScriptError: a required script for this event failed,
-                timed out, or was skipped because the project tier is not
-                trusted.  Scripts after it do not run.
+                timed out, was skipped because the project tier is not
+                trusted, or declares an invalid ``required`` value.
+                Scripts after it do not run.
         """
         from apm_cli.core.script_executors import dispatch_http_batch, execute_script
 
-        self._emit_skip_notice()
-
-        untrusted = [s for s in self._skipped_entries if s.required and s.event == event_name]
-        if untrusted:
-            raise RequiredScriptError(
-                f"{len(untrusted)} required {event_name} script(s) in "
-                f"{self._skipped_project_file or 'apm.yml'} are not trusted. Review the "
-                "lifecycle: block and run 'apm lifecycle trust', or set APM_NO_SCRIPTS=1 "
-                "to skip all lifecycle scripts."
-            )
+        self._check_required_entries(event_name)
+        self._emit_skip_notice(event_name)
 
         matching = [s for s in self._scripts if s.event == event_name]
         if not matching:
@@ -561,21 +624,15 @@ class LifecycleScriptRunner:
 
     def _run_required(self, script: ScriptEntry, event_name: str, event: LifecycleEvent) -> None:
         """Run a required command script; raise RequiredScriptError unless it succeeds."""
-        from apm_cli.core.script_executors import run_command_script
+        from apm_cli.core.script_executors import redact_script_text, run_command_script
 
-        label = script.description or script.effective_command or "(no command)"
-        try:
-            outcome = run_command_script(
-                script,
-                event,
-                logger=self._logger,
-                verbose=self._verbose,
-                project_root=self._project_root,
-            )
-        except Exception as exc:
-            raise RequiredScriptError(
-                f"Required {event_name} script could not run: {label}"
-            ) from exc
+        outcome = run_command_script(
+            script,
+            event,
+            logger=self._logger,
+            verbose=self._verbose,
+            project_root=self._project_root,
+        )
         if outcome.ok:
             return
         if outcome.status == "timeout":
@@ -583,20 +640,88 @@ class LifecycleScriptRunner:
         elif outcome.exit_code is not None:
             reason = f"exited with code {outcome.exit_code}"
         else:
-            reason = "could not run"
-        message = f"Required {event_name} script {reason}: {label}"
-        detail = outcome.stderr.strip()
-        if detail:
-            message = f"{message}\n{detail}"
-        raise RequiredScriptError(message)
-
-    def has_skipped(self, event_name: str) -> bool:
-        """Whether a project script for event_name was skipped as untrusted."""
-        return any(s.event == event_name for s in self._skipped_entries)
+            reason = "could not start"
+        command = redact_script_text(script, script.effective_command or "(no command)")
+        label = f"{script.description} ({command})" if script.description else command
+        raise RequiredScriptError(
+            f"Required {event_name} script {reason}: {label}", outcome.stderr_lines
+        )
 
     def scripts_for_event(self, event_name: str) -> list[ScriptEntry]:
         """Return scripts registered for event_name (public API)."""
         return [s for s in self._scripts if s.event == event_name]
+
+
+def report_required_script_error(
+    error: RequiredScriptError, logger: CommandLogger, *, verbose: bool
+) -> None:
+    """Render a RequiredScriptError the same way in every command.
+
+    The summary is an error line. The script's own output is shown only with
+    --verbose, indented, because it is script-controlled text; otherwise the
+    user is pointed at the scripts log and the verbose flag.
+    """
+    from apm_cli.core.script_executors import script_log_path
+
+    logger.error(str(error))
+    if verbose:
+        for line in error.detail:
+            logger.verbose_detail(f"    {line}")
+        return
+    if error.detail:
+        logger.progress(
+            f"Run with --verbose to see the script's output, or read {script_log_path()}."
+        )
+
+
+def packages_from_dependencies(dependencies: Iterable[object]) -> list[PackageInfo]:
+    """The event payload's package list, from a manifest's dependency references."""
+    return [
+        PackageInfo(
+            name=getattr(dep, "repo_url", None) or str(dep),
+            reference=getattr(dep, "reference", None),
+        )
+        for dep in dependencies
+    ]
+
+
+def fire_lifecycle_event(
+    event_name: str,
+    *,
+    packages: list[PackageInfo],
+    scope: str,
+    project_root: str | None,
+    logger: CommandLogger | None = None,
+    verbose: bool = False,
+    runner: LifecycleScriptRunner | None = None,
+) -> list[threading.Thread]:
+    """Discover and fire event_name for one command; the single firing owner.
+
+    Best-effort: discovery or execution errors never block the command,
+    except RequiredScriptError, which the command reports with
+    report_required_script_error and turns into exit code 1.  Pass
+    ``runner`` to reuse one discovery for a command's pre- and post-events.
+    """
+    try:
+        if runner is None:
+            runner = build_runner_from_context(
+                logger=logger,
+                verbose=verbose,
+                project_root=project_root,
+                events=(event_name,),
+            )
+        event = LifecycleEvent.create(
+            event=event_name,
+            packages=packages,
+            scope=scope,
+            working_directory=project_root,
+        )
+        return runner.fire(event_name, event)
+    except RequiredScriptError:
+        raise
+    except Exception:
+        _logger.debug("Lifecycle event %s failed to fire", event_name, exc_info=True)
+        return []
 
 
 # -- Convenience: build runner from file-based discovery -------------------
@@ -607,6 +732,7 @@ def build_runner_from_context(
     logger: CommandLogger | None = None,
     verbose: bool = False,
     project_root: str | None = None,
+    events: tuple[str, ...] | None = None,
 ) -> LifecycleScriptRunner:
     """Create a LifecycleScriptRunner via file-based discovery.
 
@@ -656,6 +782,10 @@ def build_runner_from_context(
         # abort the install/update/uninstall flow.
         project_entries, project_fp = [], None
     scripts.extend(project_entries)
+    if events is not None:
+        # Keep org-policy discovery off the path of commands whose events
+        # have no scripts (e.g. every compile when only install hooks exist).
+        scripts = [s for s in scripts if s.event in events]
 
     if not scripts:
         return LifecycleScriptRunner(

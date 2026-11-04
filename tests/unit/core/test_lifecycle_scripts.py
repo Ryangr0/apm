@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -22,10 +23,15 @@ from apm_cli.core.lifecycle_scripts import (
     _get_policy_scripts_dir,
     build_runner_from_context,
     discover_scripts,
+    fire_lifecycle_event,
+    is_pre_event,
+    packages_from_dependencies,
     parse_apm_yml_lifecycle,
     parse_project_script_file,
     parse_script_file,
+    report_required_script_error,
 )
+from apm_cli.core.script_executors import CommandOutcome
 
 
 def _write_yaml(path: Path, data: dict) -> Path:
@@ -158,47 +164,44 @@ class TestParseApmYmlLifecycle:
 
 
 class TestRequiredField:
+    def _entry(self, tmp_path: Path, event: str, raw: dict) -> ScriptEntry:
+        path = _write_yaml(tmp_path / "apm.yml", {"lifecycle": {event: [raw]}})
+        return parse_apm_yml_lifecycle(path, "project")[0]
+
     def test_required_true_on_pre_event_command(self, tmp_path: Path) -> None:
-        path = _write_yaml(
-            tmp_path / "apm.yml",
-            {"lifecycle": {"pre-compile": [{"type": "command", "run": "gen", "required": True}]}},
-        )
-        assert parse_apm_yml_lifecycle(path, "project")[0].required is True
+        entry = self._entry(tmp_path, "pre-compile", {"run": "gen", "required": True})
+        assert entry.required is True
+        assert entry.required_issue is None
 
     def test_required_defaults_to_false(self, tmp_path: Path) -> None:
-        path = _write_yaml(
-            tmp_path / "apm.yml",
-            {"lifecycle": {"pre-compile": [{"type": "command", "run": "gen"}]}},
-        )
-        assert parse_apm_yml_lifecycle(path, "project")[0].required is False
+        entry = self._entry(tmp_path, "pre-compile", {"run": "gen"})
+        assert entry.required is False
+        assert entry.required_issue is None
 
     @pytest.mark.parametrize("value", ["true", 1, "yes"])
-    def test_required_accepts_only_boolean_true(self, tmp_path: Path, value: object) -> None:
-        path = _write_yaml(
-            tmp_path / "apm.yml",
-            {"lifecycle": {"pre-compile": [{"type": "command", "run": "gen", "required": value}]}},
-        )
-        assert parse_apm_yml_lifecycle(path, "project")[0].required is False
+    def test_non_boolean_is_an_issue(self, tmp_path: Path, value: object) -> None:
+        entry = self._entry(tmp_path, "pre-compile", {"run": "gen", "required": value})
+        assert entry.required is False
+        assert entry.required_issue == "'required' must be true or false"
 
-    def test_required_ignored_on_post_event(self, tmp_path: Path) -> None:
-        path = _write_yaml(
-            tmp_path / "apm.yml",
-            {"lifecycle": {"post-install": [{"type": "command", "run": "x", "required": True}]}},
-        )
-        assert parse_apm_yml_lifecycle(path, "project")[0].required is False
+    def test_post_event_is_an_issue(self, tmp_path: Path) -> None:
+        entry = self._entry(tmp_path, "post-install", {"run": "x", "required": True})
+        assert entry.required is False
+        assert entry.required_issue == "'required' applies only to pre-* events"
 
-    def test_required_ignored_on_http_script(self, tmp_path: Path) -> None:
-        path = _write_yaml(
-            tmp_path / "apm.yml",
-            {
-                "lifecycle": {
-                    "pre-install": [
-                        {"type": "http", "url": "https://example.com/hook", "required": True}
-                    ]
-                }
-            },
+    def test_http_script_is_an_issue(self, tmp_path: Path) -> None:
+        entry = self._entry(
+            tmp_path, "pre-install", {"url": "https://example.com/hook", "required": True}
         )
-        assert parse_apm_yml_lifecycle(path, "project")[0].required is False
+        assert entry.required is False
+        assert entry.required_issue == "'required' applies only to command scripts"
+
+    @pytest.mark.parametrize(
+        ("event", "expected"),
+        [("pre-compile", True), ("pre-install", True), ("post-install", False), ("pre-x", False)],
+    )
+    def test_is_pre_event(self, event: str, expected: bool) -> None:
+        assert is_pre_event(event) is expected
 
 
 @pytest.mark.windows_compat
@@ -328,81 +331,42 @@ class TestLifecycleScriptRunner:
             runner.fire("post-install", self._make_event())
         assert call_count == 2
 
-    def test_required_failure_raises_and_stops_later_scripts(self) -> None:
-        from apm_cli.core.script_executors import CommandOutcome
-
-        required = ScriptEntry(
-            script_type="command", event="pre-compile", bash="gen", required=True
+    def _required(self, **kw) -> ScriptEntry:
+        return ScriptEntry(
+            script_type="command", event="pre-compile", bash="gen", required=True, **kw
         )
+
+    def test_required_failure_raises_and_stops_later_scripts(self) -> None:
         later = ScriptEntry(script_type="command", event="pre-compile", bash="later")
-        runner = LifecycleScriptRunner(scripts=[required, later])
-        failed = CommandOutcome(status="error", exit_code=3, stderr="composer.json missing")
+        runner = LifecycleScriptRunner(scripts=[self._required(), later])
+        failed = CommandOutcome(status="error", exit_code=3, stderr_lines=("no composer.json",))
         with (
             patch("apm_cli.core.script_executors.run_command_script", return_value=failed),
             patch("apm_cli.core.script_executors.execute_script") as mock_exec,
-            pytest.raises(RequiredScriptError, match="exited with code 3: gen"),
-        ):
-            runner.fire("pre-compile", self._make_event("pre-compile"))
-        mock_exec.assert_not_called()
-
-    def test_required_failure_quotes_stderr(self) -> None:
-        from apm_cli.core.script_executors import CommandOutcome
-
-        required = ScriptEntry(
-            script_type="command", event="pre-compile", bash="gen", required=True
-        )
-        runner = LifecycleScriptRunner(scripts=[required])
-        failed = CommandOutcome(status="error", exit_code=1, stderr="composer.json missing\n")
-        with (
-            patch("apm_cli.core.script_executors.run_command_script", return_value=failed),
             pytest.raises(RequiredScriptError) as raised,
         ):
             runner.fire("pre-compile", self._make_event("pre-compile"))
-        assert str(raised.value).endswith("composer.json missing")
+        assert str(raised.value) == "Required pre-compile script exited with code 3: gen"
+        assert raised.value.detail == ("no composer.json",)
+        mock_exec.assert_not_called()
 
-    def test_required_timeout_raises(self) -> None:
-        from apm_cli.core.script_executors import CommandOutcome
-
-        required = ScriptEntry(
-            script_type="command",
-            event="pre-compile",
-            bash="gen",
-            required=True,
-            timeout_sec=5,
-            description="Compose Boost guidelines",
-        )
-        runner = LifecycleScriptRunner(scripts=[required])
+    def test_required_failure_label_names_description_and_command(self) -> None:
+        runner = LifecycleScriptRunner(scripts=[self._required(description="Generate rules")])
         with (
             patch(
                 "apm_cli.core.script_executors.run_command_script",
                 return_value=CommandOutcome(status="timeout"),
             ),
-            pytest.raises(RequiredScriptError, match="timed out after 5s: Compose Boost"),
+            pytest.raises(RequiredScriptError) as raised,
         ):
             runner.fire("pre-compile", self._make_event("pre-compile"))
-
-    def test_required_executor_exception_raises(self) -> None:
-        required = ScriptEntry(
-            script_type="command", event="pre-install", bash="gen", required=True
+        assert str(raised.value) == (
+            "Required pre-compile script timed out after 30s: Generate rules (gen)"
         )
-        runner = LifecycleScriptRunner(scripts=[required])
-        with (
-            patch(
-                "apm_cli.core.script_executors.run_command_script",
-                side_effect=RuntimeError("boom"),
-            ),
-            pytest.raises(RequiredScriptError, match="could not run: gen"),
-        ):
-            runner.fire("pre-install", self._make_event("pre-install"))
 
     def test_required_success_continues(self) -> None:
-        from apm_cli.core.script_executors import CommandOutcome
-
-        required = ScriptEntry(
-            script_type="command", event="pre-compile", bash="gen", required=True
-        )
         later = ScriptEntry(script_type="command", event="pre-compile", bash="later")
-        runner = LifecycleScriptRunner(scripts=[required, later])
+        runner = LifecycleScriptRunner(scripts=[self._required(), later])
         with (
             patch(
                 "apm_cli.core.script_executors.run_command_script",
@@ -413,25 +377,81 @@ class TestLifecycleScriptRunner:
             runner.fire("pre-compile", self._make_event("pre-compile"))
         mock_exec.assert_called_once()
 
-    def test_untrusted_required_script_raises(self) -> None:
-        skipped = ScriptEntry(script_type="command", event="pre-compile", bash="gen", required=True)
+    def test_real_required_script_failure_raises(self, tmp_path: Path) -> None:
+        command = f'"{sys.executable}" -c "import sys; sys.exit(6)"'
+        script = ScriptEntry(
+            script_type="command", event="pre-compile", command=command, required=True
+        )
+        runner = LifecycleScriptRunner(scripts=[script], project_root=str(tmp_path))
+        with pytest.raises(RequiredScriptError, match="exited with code 6"):
+            runner.fire("pre-compile", self._make_event("pre-compile"))
+
+    def test_untrusted_required_script_raises_without_skip_notice(self) -> None:
+        logger = MagicMock()
         runner = LifecycleScriptRunner(
             scripts=[],
+            logger=logger,
             skipped_project_scripts=1,
             skipped_project_file="/repo/apm.yml",
-            skipped_entries=[skipped],
+            skipped_entries=[self._required()],
         )
         with pytest.raises(RequiredScriptError, match="apm lifecycle trust"):
             runner.fire("pre-compile", self._make_event("pre-compile"))
+        logger.warning.assert_not_called()
 
     def test_untrusted_required_script_for_other_event_does_not_raise(self) -> None:
-        skipped = ScriptEntry(script_type="command", event="pre-install", bash="gen", required=True)
-        runner = LifecycleScriptRunner(
-            scripts=[], skipped_project_scripts=1, skipped_entries=[skipped]
-        )
+        skipped = ScriptEntry(script_type="command", event="pre-install", bash="g", required=True)
+        runner = LifecycleScriptRunner(scripts=[], skipped_entries=[skipped])
         assert runner.fire("pre-compile", self._make_event("pre-compile")) == []
-        assert runner.has_skipped("pre-install")
-        assert not runner.has_skipped("pre-compile")
+
+    def test_skip_notice_counts_only_this_event(self) -> None:
+        logger = MagicMock()
+        skipped = [
+            ScriptEntry(script_type="command", event="pre-compile", bash="a"),
+            ScriptEntry(script_type="command", event="post-install", bash="b"),
+            ScriptEntry(script_type="command", event="post-install", bash="c"),
+        ]
+        runner = LifecycleScriptRunner(
+            scripts=[], logger=logger, skipped_project_scripts=3, skipped_entries=skipped
+        )
+        runner.fire("pre-compile", self._make_event("pre-compile"))
+        logger.warning.assert_called_once_with(
+            "Skipped 1 untrusted project script(s) for pre-compile. "
+            "Run 'apm lifecycle trust' to enable them."
+        )
+
+    def test_invalid_required_value_on_pre_command_raises(self) -> None:
+        script = ScriptEntry(
+            script_type="command",
+            event="pre-compile",
+            bash="gen",
+            required_issue="'required' must be true or false",
+            source_file="apm.yml",
+        )
+        runner = LifecycleScriptRunner(scripts=[script])
+        with (
+            patch("apm_cli.core.script_executors.execute_script") as mock_exec,
+            pytest.raises(RequiredScriptError, match="must be true or false"),
+        ):
+            runner.fire("pre-compile", self._make_event("pre-compile"))
+        mock_exec.assert_not_called()
+
+    def test_required_on_post_event_warns_and_runs(self) -> None:
+        logger = MagicMock()
+        script = ScriptEntry(
+            script_type="command",
+            event="post-install",
+            bash="x",
+            required_issue="'required' applies only to pre-* events",
+            source_file="apm.yml",
+        )
+        runner = LifecycleScriptRunner(scripts=[script], logger=logger)
+        with patch("apm_cli.core.script_executors.execute_script") as mock_exec:
+            runner.fire("post-install", self._make_event())
+        mock_exec.assert_called_once()
+        logger.warning.assert_called_once_with(
+            "post-install script in apm.yml: 'required' applies only to pre-* events; ignored."
+        )
 
     def test_scripts_for_event_filters(self) -> None:
         s1 = ScriptEntry(script_type="command", event="post-install", bash="echo a")
@@ -493,9 +513,7 @@ class TestBuildRunnerFromContext:
         assert runner._scripts == []
         assert runner._skipped_project_scripts == 1
 
-    def test_untrusted_required_project_script_is_recorded(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_untrusted_required_project_script_raises(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.delenv("APM_NO_SCRIPTS", raising=False)
         _write_yaml(
             tmp_path / "apm.yml",
@@ -506,7 +524,6 @@ class TestBuildRunnerFromContext:
             patch("apm_cli.policy.discovery.discover_policy_with_chain", return_value=None),
         ):
             runner = build_runner_from_context(project_root=str(tmp_path))
-        assert runner.has_skipped("pre-compile")
         with pytest.raises(RequiredScriptError):
             runner.fire("pre-compile", LifecycleEvent.create(event="pre-compile"))
 
@@ -518,6 +535,32 @@ class TestBuildRunnerFromContext:
         )
         runner = build_runner_from_context(project_root=str(tmp_path))
         assert runner.fire("pre-compile", LifecycleEvent.create(event="pre-compile")) == []
+
+    def test_deny_all_skips_untrusted_required_scripts(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("APM_NO_SCRIPTS", raising=False)
+        _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"pre-compile": [{"run": "gen", "required": True}]}},
+        )
+        fetch = MagicMock()
+        fetch.policy.executables.deny_all = True
+        with (
+            patch("apm_cli.core.script_trust.is_fingerprint_trusted", return_value=False),
+            patch("apm_cli.policy.discovery.discover_policy_with_chain", return_value=fetch),
+        ):
+            runner = build_runner_from_context(project_root=str(tmp_path))
+        assert runner.fire("pre-compile", LifecycleEvent.create(event="pre-compile")) == []
+
+    def test_events_filter_skips_policy_discovery(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("APM_NO_SCRIPTS", raising=False)
+        _write_yaml(
+            tmp_path / "apm.yml",
+            {"lifecycle": {"post-install": [{"run": "echo hi"}]}},
+        )
+        with patch("apm_cli.policy.discovery.discover_policy_with_chain") as discover:
+            runner = build_runner_from_context(project_root=str(tmp_path), events=("pre-compile",))
+        discover.assert_not_called()
+        assert runner.scripts_for_event("post-install") == []
 
     def test_trusted_project_scripts_are_included(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.delenv("APM_NO_SCRIPTS", raising=False)
@@ -545,6 +588,59 @@ class TestBuildRunnerFromContext:
         ):
             runner = build_runner_from_context(project_root=str(tmp_path))
         assert any(script.bash == "echo user-notify" for script in runner._scripts)
+
+
+class TestFireLifecycleEvent:
+    def test_fires_through_supplied_runner(self) -> None:
+        runner = MagicMock()
+        runner.fire.return_value = []
+        fire_lifecycle_event(
+            "pre-install",
+            packages=packages_from_dependencies([]),
+            scope="project",
+            project_root="/repo",
+            runner=runner,
+        )
+        assert runner.fire.call_args.args[0] == "pre-install"
+        assert runner.fire.call_args.args[1].event == "pre-install"
+
+    def test_isolates_unexpected_errors(self) -> None:
+        runner = MagicMock()
+        runner.fire.side_effect = RuntimeError("boom")
+        assert (
+            fire_lifecycle_event(
+                "post-install", packages=[], scope="project", project_root=None, runner=runner
+            )
+            == []
+        )
+
+    def test_reraises_required_script_error(self) -> None:
+        runner = MagicMock()
+        runner.fire.side_effect = RequiredScriptError("Required pre-install script failed")
+        with pytest.raises(RequiredScriptError):
+            fire_lifecycle_event(
+                "pre-install", packages=[], scope="project", project_root=None, runner=runner
+            )
+
+    def test_packages_from_dependencies(self) -> None:
+        dep = MagicMock(repo_url="org/repo", reference="v1")
+        assert packages_from_dependencies([dep]) == [PackageInfo(name="org/repo", reference="v1")]
+
+
+class TestReportRequiredScriptError:
+    def test_quiet_points_at_verbose_and_log(self) -> None:
+        logger = MagicMock()
+        error = RequiredScriptError("Required pre-compile script exited with code 1: gen", ("x",))
+        report_required_script_error(error, logger, verbose=False)
+        logger.error.assert_called_once_with(str(error))
+        assert "--verbose" in logger.progress.call_args.args[0]
+        logger.verbose_detail.assert_not_called()
+
+    def test_verbose_shows_indented_detail(self) -> None:
+        logger = MagicMock()
+        error = RequiredScriptError("Required pre-compile script failed: gen", ("a", "b"))
+        report_required_script_error(error, logger, verbose=True)
+        assert [c.args[0] for c in logger.verbose_detail.call_args_list] == ["    a", "    b"]
 
 
 class TestConstants:

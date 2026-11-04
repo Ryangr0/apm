@@ -702,6 +702,14 @@ MUTATIONS: tuple[MutationCase, ...] = (
         intent="Direct MCP target resolution stops consuming the command's scope decision.",
     ),
     MutationCase(
+        guard_id="install-deployment-lifecycle-event-firing",
+        rule_id="install-deployment-lifecycle-event-firing",
+        path="src/apm_cli/commands/compile/cli.py",
+        old="    fire_lifecycle_event(\n",
+        new="    runner.fire(\n",
+        intent="Compile fires a lifecycle event without the canonical firing owner.",
+    ),
+    MutationCase(
         guard_id="install-deployment-lifecycle-serialization",
         rule_id="install-deployment-lifecycle-serialization",
         path="src/apm_cli/commands/config.py",

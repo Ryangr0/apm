@@ -11,6 +11,7 @@ import click
 from ...codex_plugins.client import CodexNativeError
 from ...constants import APM_YML_FILENAME
 from ...core.command_logger import CommandLogger
+from ...core.lifecycle_scripts import RequiredScriptError, report_required_script_error
 from ...install.locking import serialized_lifecycle
 from ...models.apm_package import APMPackage
 from ...utils.path_security import PathTraversalError
@@ -741,6 +742,9 @@ def uninstall(ctx, packages, dry_run, verbose, global_):
         if cleanup_incomplete:
             sys.exit(1)
 
+    except RequiredScriptError as e:
+        report_required_script_error(e, logger, verbose=verbose)
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error uninstalling packages: {e}")
         sys.exit(1)
@@ -827,44 +831,18 @@ def _fire_uninstall_scripts(
     verbose: bool,
     deploy_root,
 ) -> None:
-    """Build a script runner and fire an uninstall lifecycle event.
+    """Fire an uninstall lifecycle event through the lifecycle owner.
 
-    Best-effort: all exceptions are swallowed so scripts never block
-    the uninstall flow, except a failed required pre-uninstall script,
-    which is reported and exits 1 before anything changes.
+    Best-effort, except a failed required pre-uninstall script, which raises
+    RequiredScriptError for the command to report before anything is removed.
     """
-    import contextlib
+    from apm_cli.core.lifecycle_scripts import PackageInfo, fire_lifecycle_event
 
-    from apm_cli.core.lifecycle_scripts import RequiredScriptError
-
-    required_failure: RequiredScriptError | None = None
-    with contextlib.suppress(Exception):
-        from apm_cli.core.lifecycle_scripts import (
-            LifecycleEvent,
-            PackageInfo,
-            build_runner_from_context,
-        )
-
-        runner = build_runner_from_context(
-            logger=logger,
-            verbose=verbose,
-            project_root=str(deploy_root),
-        )
-
-        pkg_infos = [PackageInfo(name=str(pkg)) for pkg in packages]
-        scope_name = scope.value if hasattr(scope, "value") else str(scope)
-        event = LifecycleEvent.create(
-            event=event_name,
-            packages=pkg_infos,
-            scope=scope_name,
-            working_directory=str(deploy_root),
-        )
-
-        try:
-            runner.fire(event_name, event)
-        except RequiredScriptError as exc:
-            required_failure = exc
-
-    if required_failure is not None:
-        logger.error(str(required_failure))
-        sys.exit(1)
+    fire_lifecycle_event(
+        event_name,
+        packages=[PackageInfo(name=str(pkg)) for pkg in packages],
+        scope=scope.value if hasattr(scope, "value") else str(scope),
+        project_root=str(deploy_root),
+        logger=logger,
+        verbose=verbose,
+    )

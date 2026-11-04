@@ -131,7 +131,7 @@ from ..constants import (
 )
 from ..core.auth import AuthResolver
 from ..core.command_logger import InstallLogger, _ValidationOutcome
-from ..core.lifecycle_scripts import RequiredScriptError
+from ..core.lifecycle_scripts import RequiredScriptError, report_required_script_error
 from ..core.project_name import (
     resolve_bootstrap_project_name as _resolve_bootstrap_project_name,
 )
@@ -1948,7 +1948,7 @@ def _install_apm_packages(ctx, outcome):
             log_frozen_install_error(e, logger)
             raise InstallFailureAlreadyRendered(str(e)) from e
         except RequiredScriptError as e:
-            logger.error(str(e))
+            report_required_script_error(e, logger, verbose=ctx.verbose)
             raise InstallFailureAlreadyRendered(str(e)) from e
         except InstallFailureAlreadyRendered:
             raise

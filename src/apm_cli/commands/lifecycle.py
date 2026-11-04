@@ -6,7 +6,7 @@ Sub-commands:
 * ``apm lifecycle test``     -- preview (dry-run) a synthetic event; --execute to run
 * ``apm lifecycle init``     -- inject a starter lifecycle: block into apm.yml
 * ``apm lifecycle validate`` -- check all script files for errors
-* ``apm lifecycle trust``    -- trust apm.yml lifecycle: so its scripts run on install
+* ``apm lifecycle trust``    -- trust apm.yml lifecycle: so its scripts run
 * ``apm lifecycle untrust``  -- revoke trust for apm.yml lifecycle:
 """
 
@@ -185,6 +185,9 @@ def lifecycle_test(event: str, verbose: bool, execute: bool) -> None:
         threads = runner.fire(event, synthetic_event)
     except RequiredScriptError as e:
         _rich_error(str(e), symbol="error")
+        if verbose:
+            for line in e.detail:
+                _rich_echo(f"    {line}", style="dim")
         sys.exit(1)
 
     for t in threads:
@@ -430,6 +433,7 @@ def _validate_script_file(path: Path, source: str) -> list[str]:
         LIFECYCLE_EVENTS,
         SCRIPT_FILE_VERSION,
         SCRIPT_TYPES,
+        required_issue,
     )
 
     errors: list[str] = []
@@ -511,13 +515,9 @@ def _validate_script_file(path: Path, source: str) -> list[str]:
                         f"{prefix}: command script needs 'bash', 'command', or 'run' field"
                     )
 
-            if "required" in entry:
-                if not isinstance(entry["required"], bool):
-                    errors.append(f"{prefix}: 'required' must be true or false")
-                elif script_type != "command":
-                    errors.append(f"{prefix}: 'required' applies only to command scripts")
-                elif not event_name.startswith("pre-"):
-                    errors.append(f"{prefix}: 'required' applies only to pre-* events")
+            issue = required_issue(entry, script_type, event_name)
+            if issue is not None:
+                errors.append(f"{prefix}: {issue}")
 
             if script_type == "http":
                 url = entry.get("url")
@@ -547,7 +547,7 @@ def _validate_script_file(path: Path, source: str) -> list[str]:
 
 @lifecycle.command(
     name="trust",
-    help="Trust the project apm.yml lifecycle: block so its scripts run on install.",
+    help="Trust the project apm.yml lifecycle: block so its scripts run.",
 )
 def lifecycle_trust() -> None:
     """Record trust for the current lifecycle: subtree of apm.yml.
@@ -573,7 +573,8 @@ def lifecycle_trust() -> None:
         return
 
     _rich_warning(
-        "Project lifecycle scripts can run arbitrary commands during apm install/update/uninstall.",
+        "Project lifecycle scripts can run arbitrary commands during apm install, update, "
+        "uninstall, and compile.",
         symbol="warning",
     )
     fingerprint = trust_project_scripts(project_file)

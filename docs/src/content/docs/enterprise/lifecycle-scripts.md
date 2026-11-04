@@ -6,8 +6,9 @@ sidebar:
 ---
 
 APM supports **lifecycle scripts** -- custom actions that fire automatically
-at key moments during install, update, uninstall, and compile operations. Scripts live
-inside `apm.yml` under a `lifecycle:` key -- no separate config files to manage.
+at key moments during install, update, uninstall, and compile operations.
+Scripts live inside `apm.yml` under a `lifecycle:` key -- no separate config
+files to manage.
 
 ```yaml
 # apm.yml
@@ -24,10 +25,10 @@ Project scripts require explicit trust before they run: `apm lifecycle trust`.
 See the [CLI reference](../../reference/cli/lifecycle/) for all subcommands.
 
 A failing script never aborts the CLI operation, unless it is a command
-script on a `pre-*` event marked [`required: true`](#required-scripts).
-HTTP scripts dispatch in a
-background thread (fire-and-forget), while command scripts run synchronously
-and can delay the operation until they finish or their timeout elapses.
+script on a `pre-*` event marked [`required: true`](#required-scripts). HTTP
+scripts dispatch in a background thread (fire-and-forget), while command
+scripts run synchronously and can delay the operation until they finish or
+their timeout elapses.
 
 Scripts are defined in three tiers. The **project tier** uses the repository `apm.yml`
 manifest under a top-level `lifecycle:` key. The **user tier** uses
@@ -48,7 +49,7 @@ fleet-managed deployment.
 | `post-update`    | After a successful update completes  |
 | `pre-uninstall`  | Before uninstall begins              |
 | `post-uninstall` | After a successful uninstall         |
-| `pre-compile`    | Before `apm compile` reads sources; not on `--dry-run` or `--validate` |
+| `pre-compile`    | Before `apm compile` reads sources; not with `--dry-run`, `--validate`, `--watch`, `--root`, or `--global` |
 
 ## Script file format
 
@@ -125,7 +126,6 @@ Fields:
 - `cwd` -- working directory (relative paths resolve against project root)
 - `env` -- extra environment variables merged into the process env
 - `timeoutSec` -- execution timeout (default: 30s)
-
 - `required` -- (optional, `pre-*` events only) stop the operation when the
   script fails; see [Required scripts](#required-scripts)
 
@@ -137,41 +137,49 @@ By default a failing script is isolated: the operation continues. A command
 script on a `pre-*` event can set `required: true` instead. The operation then
 stops with exit code 1, before it changes anything, when the script:
 
-- exits non-zero, times out, or cannot start (the error quotes the end of its
-  stderr, with credential values redacted);
+- exits non-zero, times out, or cannot start. The error names the script; run
+  with `--verbose` to see the end of its stderr (printable ASCII, credential
+  values redacted), or read the scripts log;
 - is a project script that is not trusted. Review the `lifecycle:` block and
-  run `apm lifecycle trust`, or skip all scripts with `APM_NO_SCRIPTS=1`.
+  run `apm lifecycle trust` to allow it on this machine.
 
-`APM_NO_SCRIPTS=1` and org policy `executables.deny_all: true` still suppress
-required scripts: both are explicit decisions to run no scripts. Scripts after
-a failed required script do not run. `apm lifecycle validate` rejects
-`required` on HTTP scripts and `post-*` events, and a value other than `true`
-or `false`.
+Scripts after a failed required script do not run. `APM_NO_SCRIPTS=1` and org
+policy `executables.deny_all: true` still suppress required scripts: both are
+explicit decisions to run no scripts.
+
+`required` must be `true` or `false`; any other value on a `pre-*` command
+script stops the operation, so a typo cannot silently turn the check off.
+On an HTTP script or a `post-*` event it has no effect and APM prints a
+warning. `apm lifecycle validate` reports all three cases.
 
 ### Generating sources before compile
 
-Some toolchains compose agent guidance from the project's own dependencies.
-A required `pre-compile` script runs such a generator, writes its output under
-`.apm/`, and `apm compile` reads it like any other primitive. Laravel Boost,
-for example, composes the guidelines that installed Composer packages ship:
+A required `pre-compile` script can generate instructions from the project's
+own toolchain, for example a framework that composes guidance from installed
+dependencies. It writes under `.apm/`, and `apm compile` reads the result like
+any other primitive:
 
 ```yaml
 lifecycle:
   pre-compile:
     - type: command
-      description: "Compose Laravel guidelines"
-      run: "php artisan boost:install --guidelines -n"
-      cwd: "apps/backend"
+      description: "Generate framework guidelines"
+      run: "./scripts/generate-guidelines.sh"
       timeoutSec: 120
       required: true
 ```
 
-Configure the generator to write into a source file such as
-`.apm/instructions/laravel-boost.instructions.md`, not into `AGENTS.md` or
-`CLAUDE.md`, which compile owns. In CI, run `apm lifecycle trust` before
-`apm compile`, or the required script stops the job as untrusted. To deploy the
-generated file to targets that `apm install` serves, add the same entry under
-`pre-install`.
+Point the generator at a source file such as
+`.apm/instructions/framework.instructions.md`, with its own `applyTo`
+frontmatter, never at `AGENTS.md` or `CLAUDE.md`, which compile owns. To deploy
+the generated file to the targets `apm install` serves, add the same entry
+under `pre-install`. Compile holds APM's lifecycle lock while the script runs, so
+the script must not call other `apm` commands that change state.
+
+Trust is per machine. A CI job that runs `apm compile` either trusts the
+block explicitly or runs the generator as its own step and compiles with
+`APM_NO_SCRIPTS=1`. Trusting in CI accepts whatever `lifecycle:` a change
+contains, so do it only in jobs that already run that change's code.
 
 ### HTTP
 
@@ -257,11 +265,15 @@ Lifecycle scripts from different sources are subject to different trust rules:
   Run without a gate.
 - **Project scripts** (`apm.yml` `lifecycle:`) -- committed into the repo and
   **skipped by default.** Cloning an untrusted repo and running
-  `apm install` would otherwise execute attacker-controlled shell commands.
+  `apm install` or `apm compile` would otherwise execute attacker-controlled
+  shell commands.
   Trust is explicit, lifecycle-subtree-bound, and revocable:
   - Run `apm lifecycle trust` to record trust for the current `lifecycle:` block.
   - Any edit to `lifecycle:` revokes trust and requires re-approval.
   - Editing other `apm.yml` keys does not revoke trust.
+  - A block that names `pre-compile` needs fresh trust after upgrading from a
+    version that did not know the event, so a record given while the key was
+    inert does not start covering it.
   - Run `apm lifecycle untrust` to revoke without editing the file.
   - Trust records are stored in `~/.apm/scripts-trust.json` (or
     `$APM_HOME/scripts-trust.json`).
@@ -333,8 +345,9 @@ trends -- without any changes to individual project configurations.
 - Scripts have configurable timeouts (10s for HTTP, 30s for commands by
   default). HTTP scripts dispatch in the background; command scripts run
   synchronously and can delay the operation up to their timeout.
-- A script failure never aborts the CLI operation; failures are logged in
-  verbose mode (`--verbose`).
+- A script failure never aborts the CLI operation unless the script is
+  [required](#required-scripts); failures are logged in verbose mode
+  (`--verbose`).
 
 ## Script output log
 

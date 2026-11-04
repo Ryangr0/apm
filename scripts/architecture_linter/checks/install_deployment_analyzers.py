@@ -38,6 +38,10 @@ from scripts.architecture_linter.checks.install_frozen_and_audit import (
     check_mcp_ownership_migration,
     check_uninstall_reachability,
 )
+from scripts.architecture_linter.checks.install_lifecycle_events import (
+    GUARD_LIFECYCLE_EVENT_FIRING,
+    check_lifecycle_event_firing,
+)
 from scripts.architecture_linter.checks.install_lsp_plugin import (
     GUARD_EXECUTABLE_TRUST,
     GUARD_LSP_LIFECYCLE,
@@ -208,6 +212,11 @@ RULES: tuple[Rule, ...] = (
         _GUARD_AUDIT_REPLAY,
         "CI audit scratch materialization routes through install/audit_replay.py.",
         check_audit_replay,
+    ),
+    _rule(
+        GUARD_LIFECYCLE_EVENT_FIRING,
+        "Lifecycle events fire and required failures render through core/lifecycle_scripts.py.",
+        check_lifecycle_event_firing,
     ),
     _rule(
         _GUARD_LIFECYCLE_SERIALIZATION,

@@ -1361,6 +1361,76 @@ def test_required_hybrid_manifest_installs_as_apm_package_through_cli_state_mach
     _assert_same_state(after_uninstall, after_audit)
 
 
+@pytest.mark.parametrize(
+    ("event", "args"),
+    (
+        ("pre-uninstall", ("uninstall", f"{_OWNER}/guarded-kit")),
+        ("pre-update", ("update", "--yes", "--parallel-downloads", "0")),
+    ),
+    ids=("uninstall", "update"),
+)
+def test_required_pre_script_failure_leaves_state_unchanged(
+    tmp_path: Path,
+    apm_binary_path: Path,
+    event: str,
+    args: tuple[str, ...],
+) -> None:
+    scenario = _new_scenario(tmp_path / f"required-{event}", apm_binary_path)
+    source = _publish(scenario, "guarded-kit", instruction="guarded")
+    consumer = scenario.consumers.create(
+        "required-pre-consumer",
+        dependencies=(source.dependency,),
+        targets=("copilot",),
+    )
+    _run_success(
+        scenario,
+        consumer,
+        _INSTALL_ARGS,
+        environment=source.environment,
+        scenario_id=f"required-{event}-install",
+    )
+    if event == "pre-update":
+        _publish_revision(scenario, source, "v2")
+    manifest = load_yaml(consumer.root / "apm.yml")
+    manifest["lifecycle"] = {
+        event: [
+            {
+                "type": "command",
+                "description": "Guard",
+                "command": "exit 5",
+                "required": True,
+            }
+        ]
+    }
+    dump_yaml(manifest, consumer.root / "apm.yml")
+    _run_success(
+        scenario,
+        consumer,
+        ("lifecycle", "trust"),
+        environment=scenario.environment,
+        scenario_id=f"required-{event}-trust",
+    )
+    deployed_instruction = ".github/instructions/guarded.instructions.md"
+    capture_args = {
+        "targets": ("copilot",),
+        "config_paths": (PurePosixPath(deployed_instruction),),
+    }
+    before = LifecycleStateSnapshot.capture(consumer.root, **capture_args)
+
+    result = scenario.runner.run(
+        args,
+        scenario_id=f"required-{event}-fails",
+        cwd=consumer.root,
+        env=source.environment,
+    )
+
+    assert result.returncode == 1, _result_evidence(result)
+    assert f"Required {event} script exited with code 5: Guard (exit 5)" in " ".join(
+        result.stdout.split()
+    )
+    _assert_same_state(before, LifecycleStateSnapshot.capture(consumer.root, **capture_args))
+
+
 def test_required_pack_install_compile_audit_closes_regular_package_state(
     tmp_path: Path,
     apm_binary_path: Path,

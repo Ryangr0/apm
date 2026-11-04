@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from ..utils.net import parse_host_address
@@ -63,8 +63,16 @@ _DEFAULT_COMMAND_TIMEOUT = 30
 # they run synchronously and delay the user-facing operation.
 _SLOW_SCRIPT_THRESHOLD_SEC = 5.0
 
-# How much of a failed required script's stderr the error message quotes.
-_REQUIRED_STDERR_TAIL_CHARS = 2000
+# How much of a failed required script's stderr is kept for --verbose.
+_REQUIRED_STDERR_TAIL_LINES = 20
+_REQUIRED_STDERR_LINE_CHARS = 200
+
+# Anything outside printable ASCII is replaced: script-controlled text must
+# not reach a terminal or CI log as escape sequences (ANSI/OSC) or as
+# characters a cp1252 console cannot encode.
+_UNPRINTABLE = re.compile(r"[^\x20-\x7e\t]")
+
+CommandStatus = Literal["ok", "error", "timeout"]
 
 
 @dataclass(frozen=True)
@@ -72,13 +80,13 @@ class CommandOutcome:
     """How a command script ended.
 
     status is ``ok`` (exit 0), ``error`` (non-zero exit, no command, or the
-    process could not start) or ``timeout``.  stderr holds the tail of the
-    script's standard error, for the message a failed required script raises.
+    process could not start) or ``timeout``.  stderr_lines holds the redacted,
+    printable-ASCII tail of the script's standard error, for ``--verbose``.
     """
 
-    status: str
+    status: CommandStatus
     exit_code: int | None = None
-    stderr: str = ""
+    stderr_lines: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -364,6 +372,38 @@ def _redact_secrets(text: str) -> str:
     for value in sorted(set(secrets), key=len, reverse=True):
         redacted = redacted.replace(value, "[REDACTED]")
     return redacted
+
+
+_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+
+
+def redact_script_text(script: ScriptEntry, text: str) -> str:
+    """Redact what APM knows to be secret before script text reaches a user.
+
+    Covers credential-named environment values (as scripts.log does), the
+    values of the script's own ``env:``, and ``user:password@`` in URLs.
+    """
+    redacted = _redact_secrets(text)
+    for value in sorted((script.env or {}).values(), key=lambda v: len(str(v)), reverse=True):
+        value = str(value)
+        if len(value) >= _MIN_REDACT_LEN:
+            redacted = redacted.replace(value, "[REDACTED]")
+    return _URL_USERINFO.sub(r"\1[REDACTED]@", redacted)
+
+
+def _stderr_tail_lines(script: ScriptEntry, stderr: str) -> tuple[str, ...]:
+    """The last lines of stderr, redacted and reduced to printable ASCII."""
+    lines = [
+        _UNPRINTABLE.sub("?", line)[:_REQUIRED_STDERR_LINE_CHARS]
+        for line in redact_script_text(script, stderr).splitlines()
+        if line.strip()
+    ]
+    return tuple(lines[-_REQUIRED_STDERR_TAIL_LINES:])
+
+
+def script_log_path() -> Path:
+    """Where lifecycle script output is logged (honours APM_HOME)."""
+    return _get_scripts_log_path()
 
 
 def _redact_url_credentials(url: str) -> str:
@@ -679,10 +719,16 @@ def run_command_script(
     """Run a command script and report how it ended.
 
     The runner uses this for ``required`` scripts, whose failure aborts the
-    operation; every other script goes through :func:`execute_script`.
+    operation; every other script goes through :func:`execute_script`.  The
+    timeout warning is left to the caller, which reports the failure itself.
     """
     return _execute_command(
-        script, event, logger=logger, verbose=verbose, project_root=project_root
+        script,
+        event,
+        logger=logger,
+        verbose=verbose,
+        project_root=project_root,
+        warn_on_timeout=False,
     )
 
 
@@ -1556,6 +1602,7 @@ def _execute_command(
     logger: CommandLogger | None = None,
     verbose: bool = False,
     project_root: str | None = None,
+    warn_on_timeout: bool = True,
 ) -> CommandOutcome:
     """Execute a shell command with the event payload on stdin.
 
@@ -1567,7 +1614,7 @@ def _execute_command(
     cmd = script.effective_command
     if not cmd:
         _logger.debug("Command script has no command string, skipping")
-        return CommandOutcome(status="error", stderr="no command configured")
+        return CommandOutcome(status="error")
 
     env = _build_script_env(script)
     timeout = script.effective_timeout
@@ -1624,13 +1671,13 @@ def _execute_command(
         return CommandOutcome(
             status="ok" if returncode == 0 else "error",
             exit_code=returncode,
-            stderr=_redact_secrets(stderr)[-_REQUIRED_STDERR_TAIL_CHARS:],
+            stderr_lines=_stderr_tail_lines(script, stderr),
         )
     except subprocess.TimeoutExpired:
         _logger.debug("Command script timed out: %s", cmd)
         _kill_process_group(proc)
         _append_to_script_log(event.event, "command", cmd, status="timeout")
-        if logger:
+        if logger and warn_on_timeout:
             warn = getattr(logger, "warning", None) or getattr(logger, "verbose_detail", None)
             if warn is not None:
                 warn(
@@ -1643,9 +1690,7 @@ def _execute_command(
         _append_to_script_log(event.event, "command", cmd, stderr=str(exc), status="error")
         if verbose and logger:
             logger.verbose_detail(f"[i] Lifecycle command script failed: {cmd}")
-        return CommandOutcome(
-            status="error", stderr=_redact_secrets(str(exc))[-_REQUIRED_STDERR_TAIL_CHARS:]
-        )
+        return CommandOutcome(status="error", stderr_lines=_stderr_tail_lines(script, str(exc)))
 
 
 def _signal_kill_group(proc: subprocess.Popen | None) -> None:

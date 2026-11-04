@@ -62,6 +62,7 @@ import click
 
 from ..core.auth import AuthResolver
 from ..core.command_logger import InstallLogger
+from ..core.lifecycle_scripts import RequiredScriptError, report_required_script_error
 from ..core.target_catalog import target_help_fragment
 from ..core.target_detection import TargetParamType
 from ..deps.github_downloader import GitHubPackageDownloader
@@ -830,6 +831,9 @@ def _run_dep_update_locked(
     except (DirectDependencyError, PolicyViolationError) as e:
         _rich_error(str(e))
         sys.exit(1)
+    except RequiredScriptError as e:
+        report_required_script_error(e, logger, verbose=verbose)
+        sys.exit(1)
     except click.UsageError:
         raise
     except Exception as e:
@@ -948,55 +952,22 @@ def _fire_update_scripts(
     logger: CommandLogger | None,
     verbose: bool,
 ) -> None:
-    """Build a script runner and fire an update lifecycle event.
+    """Fire an update lifecycle event through the lifecycle owner.
 
-    Best-effort: all exceptions are swallowed so scripts never block
-    the update flow, except a failed required pre-update script, which is
-    reported and exits 1 before anything changes.
+    Best-effort, except a failed required pre-update script, which raises
+    RequiredScriptError for the command to report.
     """
-    import contextlib
+    from apm_cli.core.lifecycle_scripts import fire_lifecycle_event, packages_from_dependencies
 
-    from apm_cli.core.lifecycle_scripts import RequiredScriptError
-
-    required_failure: RequiredScriptError | None = None
-    with contextlib.suppress(Exception):
-        from apm_cli.core.lifecycle_scripts import (
-            LifecycleEvent,
-            PackageInfo,
-            build_runner_from_context,
-        )
-
-        project_root = None
-        pkg_path = getattr(apm_package, "package_path", None)
-        if pkg_path is not None:
-            project_root = str(pkg_path)
-
-        runner = build_runner_from_context(
-            logger=logger,
-            verbose=verbose,
-            project_root=project_root,
-        )
-
-        pkg_infos = []
-        for dep in apm_package.get_apm_dependencies():
-            pkg_infos.append(PackageInfo(name=dep.repo_url or str(dep), reference=dep.reference))
-
-        scope_name = scope.value if hasattr(scope, "value") else str(scope)
-        event = LifecycleEvent.create(
-            event=event_name,
-            packages=pkg_infos,
-            scope=scope_name,
-            working_directory=project_root,
-        )
-
-        try:
-            runner.fire(event_name, event)
-        except RequiredScriptError as exc:
-            required_failure = exc
-
-    if required_failure is not None:
-        _rich_error(str(required_failure))
-        sys.exit(1)
+    pkg_path = getattr(apm_package, "package_path", None)
+    fire_lifecycle_event(
+        event_name,
+        packages=packages_from_dependencies(apm_package.get_apm_dependencies()),
+        scope=scope.value if hasattr(scope, "value") else str(scope),
+        project_root=str(pkg_path) if pkg_path is not None else None,
+        logger=logger,
+        verbose=verbose,
+    )
 
 
 __all__ = ["update"]

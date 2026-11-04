@@ -1,12 +1,12 @@
 ---
 title: apm lifecycle
-description: Inspect, test, and scaffold lifecycle scripts for install/update/uninstall events.
+description: Inspect, test, and scaffold lifecycle scripts for install/update/uninstall/compile events.
 sidebar:
   order: 22
 ---
 
 Lifecycle scripts fire custom actions (shell commands, HTTPS webhooks) at key
-moments during `apm install`, `apm update`, and `apm uninstall`. This command
+moments during `apm install`, `apm update`, `apm uninstall`, and `apm compile`. This command
 group provides all tooling to discover, validate, test, scaffold, and manage
 trust for lifecycle script files.
 
@@ -77,6 +77,8 @@ Checks across all three discovery sources (policy, user, project). Reports:
 - Missing `bash`/`command` for command scripts
 - Missing or non-HTTPS `url` for HTTP scripts
 - Embedded credentials in URLs
+- A `required` value that is not `true`/`false`, or is set on an HTTP script
+  or a `post-*` event
 
 Exits `1` if any errors are found.
 
@@ -109,14 +111,17 @@ Script output is written to `~/.apm/logs/scripts.log`.
 ### `apm lifecycle trust`
 
 Trust the project `apm.yml` `lifecycle:` block so its scripts run during
-`apm install`, `apm update`, and `apm uninstall`.
+`apm install`, `apm update`, `apm uninstall`, and `apm compile`.
 
 ```bash
 apm lifecycle trust
 ```
 
 Trust is bound to the canonical `lifecycle:` subtree (SHA-256). Editing
-other `apm.yml` keys does not revoke trust; editing `lifecycle:` does.
+other `apm.yml` keys does not revoke trust; editing `lifecycle:` does. A
+block that uses `pre-compile` needs fresh trust after upgrading from a
+version that did not know the event, so a record given while it was inert
+does not start covering it.
 
 Trust records are stored at `~/.apm/scripts-trust.json` (or
 `$APM_HOME/scripts-trust.json`). To audit or reset trust manually, edit or
@@ -125,7 +130,7 @@ delete that file.
 ### `apm lifecycle untrust`
 
 Revoke trust for the `apm.yml` `lifecycle:` block. Project scripts will stop
-running on the next install/update/uninstall.
+running on the next install, update, uninstall, or compile.
 
 ```bash
 apm lifecycle untrust
@@ -143,7 +148,7 @@ apm lifecycle untrust
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
-| `1` | Error (validation failures, unreadable script file, could not record trust). |
+| `1` | Error (validation failures, unreadable script file, could not record trust, or a required script failed under `test --execute`). |
 
 ## Security notes
 

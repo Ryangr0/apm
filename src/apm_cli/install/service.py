@@ -31,7 +31,7 @@ from apm_cli.models.results import InstallDisposition
 
 if TYPE_CHECKING:
     from apm_cli.core.command_logger import InstallLogger
-    from apm_cli.core.lifecycle_scripts import LifecycleEvent, LifecycleScriptRunner
+    from apm_cli.core.lifecycle_scripts import LifecycleScriptRunner
     from apm_cli.deps.lockfile import LockFile
     from apm_cli.integration.mcp_config_view import CurrentMcpConfigView
     from apm_cli.models.apm_package import APMPackage
@@ -119,6 +119,8 @@ class InstallService:
         the pipeline when scripts are configured.
 
         Raises:
+            RequiredScriptError: a ``required`` pre-install script failed,
+                timed out, or is not trusted; the pipeline did not run.
             InstallNotAvailableError: if the dependency subsystem failed
                 to import (e.g. missing optional extras).  Adapters are
                 responsible for presenting this to the user.
@@ -135,8 +137,7 @@ class InstallService:
             self.enforce_frozen(request)
 
         runner = self._build_script_runner(request)
-        event = self._build_event("pre-install", request)
-        runner.fire("pre-install", event)
+        self._fire_event(runner, "pre-install", request)
 
         if request.frozen:
             # req-lk-006: the lockfile is never written in frozen mode.
@@ -164,8 +165,7 @@ class InstallService:
             self._enforce_frozen_no_rewrite(request, withheld)
 
         if install_worked:
-            post_event = self._build_event("post-install", request)
-            runner.fire("post-install", post_event)
+            self._fire_event(runner, "post-install", request)
 
         return result
 
@@ -226,38 +226,33 @@ class InstallService:
             logger=request.logger,
             verbose=request.verbose,
             project_root=project_root,
+            events=("pre-install", "post-install"),
         )
 
     @staticmethod
-    def _build_event(event_name: str, request: InstallRequest) -> LifecycleEvent:
-        """Build a :class:`LifecycleEvent` from the request."""
-        from apm_cli.core.lifecycle_scripts import LifecycleEvent, PackageInfo
-
-        packages = []
-        for dep in request.apm_package.get_apm_dependencies():
-            packages.append(
-                PackageInfo(
-                    name=dep.repo_url or str(dep),
-                    reference=dep.reference,
-                )
-            )
+    def _fire_event(
+        runner: LifecycleScriptRunner, event_name: str, request: InstallRequest
+    ) -> None:
+        """Fire *event_name* through the lifecycle owner with the request's context."""
+        from apm_cli.core.lifecycle_scripts import (
+            fire_lifecycle_event,
+            packages_from_dependencies,
+        )
 
         scope_name = "project"
         if request.scope is not None:
             scope_name = (
                 request.scope.value if hasattr(request.scope, "value") else str(request.scope)
             )
-
-        project_root = None
         pkg_path = getattr(request.apm_package, "package_path", None)
-        if pkg_path is not None:
-            project_root = str(pkg_path)
-
-        return LifecycleEvent.create(
-            event=event_name,
-            packages=packages,
+        fire_lifecycle_event(
+            event_name,
+            packages=packages_from_dependencies(request.apm_package.get_apm_dependencies()),
             scope=scope_name,
-            working_directory=project_root,
+            project_root=str(pkg_path) if pkg_path is not None else None,
+            logger=request.logger,
+            verbose=request.verbose,
+            runner=runner,
         )
 
     @staticmethod
