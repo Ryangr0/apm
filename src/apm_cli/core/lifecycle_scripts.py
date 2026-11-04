@@ -457,15 +457,13 @@ class LifecycleScriptRunner:
         self._skip_notice_emitted = True
         count = self._skipped_project_scripts
         msg = (
-            f"[!] Skipped {count} untrusted project script(s). "
+            f"Skipped {count} untrusted project script(s). "
             "Run 'apm lifecycle trust' to enable them."
         )
         if self._logger is not None:
-            emit = getattr(self._logger, "warning", None) or getattr(
-                self._logger, "verbose_detail", None
-            )
-            if emit is not None:
-                emit(msg)
+            from apm_cli.core.script_executors import warn_user
+
+            warn_user(self._logger, msg)
         else:
             _logger.warning("%s", msg)
 
@@ -601,10 +599,9 @@ def build_runner_from_context(
         pass
 
     if org_deny_all:
-        if logger is not None:
-            emit = getattr(logger, "warning", None) or getattr(logger, "verbose_detail", None)
-            if emit is not None:
-                emit("[!] Lifecycle scripts suppressed by org policy (executables.deny_all).")
+        from apm_cli.core.script_executors import warn_user
+
+        warn_user(logger, "Lifecycle scripts suppressed by org policy (executables.deny_all).")
         return LifecycleScriptRunner(
             scripts=[], logger=logger, verbose=verbose, project_root=project_root
         )

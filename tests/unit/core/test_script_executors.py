@@ -259,9 +259,10 @@ class TestCommandExecutor:
         patcher, _ = _patch_popen()
         with patcher, _spy_capture(raise_exc=subprocess.TimeoutExpired("slow", 30)):
             _execute_command(script, _make_event(), logger=logger, verbose=True)
-        # Timeout warning always emits (not verbose-gated); uses logger.warning.
+        # Timeout warning always emits (not verbose-gated); uses logger.warning,
+        # which adds the [!] symbol itself.
         logger.warning.assert_called_once()
-        assert "[!]" in logger.warning.call_args[0][0]
+        assert logger.warning.call_args[0][0].startswith("Lifecycle command script timed out")
 
     def test_merges_script_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("EXISTING_VAR", "original")
@@ -518,3 +519,42 @@ class TestRedactUrlCredentials:
         result = _redact_url_credentials("https://user@example.com/script")
         assert "user" not in result
         assert "example.com/script" in result
+
+
+class TestWarnUser:
+    """Lifecycle warnings render with exactly one [!] symbol."""
+
+    def test_command_logger_renders_a_single_symbol(self, capsys: pytest.CaptureFixture) -> None:
+        from apm_cli.core.command_logger import CommandLogger
+        from apm_cli.core.script_executors import warn_user
+
+        warn_user(CommandLogger("install"), "Skipped 1 untrusted project script(s).")
+        output = " ".join(capsys.readouterr().out.split())
+        assert "[!] Skipped 1 untrusted project script(s)." in output
+        assert "[!] [!]" not in output
+
+    def test_skip_notice_renders_a_single_symbol(self, capsys: pytest.CaptureFixture) -> None:
+        from apm_cli.core.command_logger import CommandLogger
+        from apm_cli.core.lifecycle_scripts import LifecycleScriptRunner
+
+        runner = LifecycleScriptRunner(
+            scripts=[], logger=CommandLogger("install"), skipped_project_scripts=1
+        )
+        runner.fire("post-install", _make_event())
+        output = " ".join(capsys.readouterr().out.split())
+        assert "[!] Skipped 1 untrusted project script(s)." in output
+        assert "[!] [!]" not in output
+
+    def test_logger_without_warning_gets_the_symbol_on_verbose(self) -> None:
+        from apm_cli.core.script_executors import warn_user
+
+        logger = MagicMock(spec=["verbose_detail"])
+        warn_user(logger, "Lifecycle scripts suppressed by org policy.")
+        logger.verbose_detail.assert_called_once_with(
+            "[!] Lifecycle scripts suppressed by org policy."
+        )
+
+    def test_no_logger_is_a_no_op(self) -> None:
+        from apm_cli.core.script_executors import warn_user
+
+        warn_user(None, "ignored")

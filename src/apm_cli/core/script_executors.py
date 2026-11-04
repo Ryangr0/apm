@@ -62,6 +62,24 @@ _DEFAULT_COMMAND_TIMEOUT = 30
 # they run synchronously and delay the user-facing operation.
 _SLOW_SCRIPT_THRESHOLD_SEC = 5.0
 
+
+def warn_user(logger: CommandLogger | None, message: str) -> None:
+    """Show a lifecycle-script warning with exactly one ``[!]`` symbol.
+
+    ``CommandLogger.warning`` adds the symbol itself, so messages carry none;
+    a logger without ``warning`` gets it prefixed on its verbose channel.
+    """
+    if logger is None:
+        return
+    warning = getattr(logger, "warning", None)
+    if warning is not None:
+        warning(message)
+        return
+    detail = getattr(logger, "verbose_detail", None)
+    if detail is not None:
+        detail(f"[!] {message}")
+
+
 # Pattern for $VAR or ${VAR} expansion in header values.
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
@@ -668,16 +686,11 @@ def _expand_env_vars(
         var_name = match.group(1) or match.group(2)
         if _is_denylisted(var_name, allowed):
             warning = (
-                f"[!] Script: credential variable '{var_name}' will NOT be expanded. "
+                f"Script: credential variable '{var_name}' will NOT be expanded. "
                 f"If you must pass it, add it to the script's 'allowedEnvVars' -- "
                 f"note this sends its value to the configured endpoint or subprocess."
             )
-            if logger is not None:
-                warn_fn = getattr(logger, "warning", None) or getattr(
-                    logger, "verbose_detail", None
-                )
-                if warn_fn is not None:
-                    warn_fn(warning)
+            warn_user(logger, warning)
             _logger.debug("Blocked credential variable expansion: %s", var_name)
             return ""
         # Strip CR/LF so a value carrying a smuggled "\r\nX-Evil: ..." cannot
@@ -1556,13 +1569,11 @@ def _execute_command(
             note = " ...[output capped: exceeded in-memory capture limit]"
             stdout = stdout + note
             stderr = stderr + note
-            if logger is not None:
-                warn = getattr(logger, "warning", None) or getattr(logger, "verbose_detail", None)
-                if warn is not None:
-                    warn(
-                        "[!] Lifecycle command script output exceeded the capture "
-                        "limit and was truncated; the script was terminated."
-                    )
+            warn_user(
+                logger,
+                "Lifecycle command script output exceeded the capture "
+                "limit and was truncated; the script was terminated.",
+            )
         _append_to_script_log(
             event.event,
             "command",
@@ -1573,23 +1584,19 @@ def _execute_command(
             status="ok" if returncode == 0 else "error",
         )
         elapsed = time.monotonic() - start
-        if elapsed > _SLOW_SCRIPT_THRESHOLD_SEC and logger is not None:
-            warn = getattr(logger, "warning", None) or getattr(logger, "verbose_detail", None)
-            if warn is not None:
-                warn(
-                    f"[!] Lifecycle command script took {elapsed:.1f}s "
-                    "(command scripts run synchronously and delay the operation)."
-                )
+        if elapsed > _SLOW_SCRIPT_THRESHOLD_SEC:
+            warn_user(
+                logger,
+                f"Lifecycle command script took {elapsed:.1f}s "
+                "(command scripts run synchronously and delay the operation).",
+            )
     except subprocess.TimeoutExpired:
         _logger.debug("Command script timed out: %s", cmd)
         _kill_process_group(proc)
         _append_to_script_log(event.event, "command", cmd, status="timeout")
-        if logger:
-            warn = getattr(logger, "warning", None) or getattr(logger, "verbose_detail", None)
-            if warn is not None:
-                warn(
-                    f"[!] Lifecycle command script timed out after {script.effective_timeout}s: {cmd}"
-                )
+        warn_user(
+            logger, f"Lifecycle command script timed out after {script.effective_timeout}s: {cmd}"
+        )
     except Exception as exc:
         _logger.debug("Command script failed: %s", cmd, exc_info=True)
         _kill_process_group(proc)
